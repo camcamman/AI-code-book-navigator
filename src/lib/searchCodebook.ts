@@ -24,8 +24,7 @@ export function loadCodebookIndex(codebookId: string): IndexedChunk[] {
   const indexFilename = `${codebookId}.index.json`;
 
   const indexPath = path.join(
-    "codebooks",
-    "raw",    // adjust if you put them somewhere else
+    "codebooks",   // adjust if you put them somewhere else
     indexFilename
   );
 
