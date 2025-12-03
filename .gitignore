@@ -1,0 +1,14 @@
+# Node / Next.js
+node_modules/
+.next/
+
+# Environment files
+.env
+.env.local
+.env.*.local
+
+# ignore the whole codebooks file as it will only get bigger and git does not like how big it is 
+codebooks/
+
+# OS / Editor junk
+.DS_Store
