@@ -6,7 +6,7 @@ export async function POST(request: Request) {
     const body = await request.json();
 
     const query: string = body.query;
-    const codebookId: string = body.codebookId || "icc-utah-2021";
+    const codebookId: string = body.codebookId || "irc-utah-2021";
     const topK: number = body.topK || 5;
 
     if (!query || typeof query !== "string") {

@@ -1,278 +1,445 @@
+// src/app/api/ask/route.ts
+
 import { NextResponse } from "next/server";
 import OpenAI from "openai";
-import { searchCodebook, type IndexedChunk } from "@/lib/searchCodebook";
+import {
+  searchCodebook,
+  loadCodebookIndex,
+  IndexedChunk,
+} from "../../../lib/searchCodebook";
+import {
+  extractStructureFromQuery,
+  findAmendmentChunksByStructure,
+  CodeStructureRef,
+} from "../../../lib/amendmentLinking";
 
 const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
 });
 
-function buildContextFromChunks(chunks: IndexedChunk[]): string {
-  return chunks
-    .map((chunk, idx) => {
-      const trimmedContent =
-        chunk.content.length > 2000
-          ? chunk.content.slice(0, 2000) + "\n...[trimmed]..."
-          : chunk.content;
+const ANSWER_MODEL =
+  process.env.OPENAI_ANSWER_MODEL || "gpt-4.1-mini"; // set to gpt-5-mini if available
+const CHECKER_MODEL =
+  process.env.OPENAI_CHECKER_MODEL || "gpt-4.1"; // set to gpt-5 if available
 
-      return [
-        `SOURCE [${idx + 1}]`,
-        `codebookId: ${chunk.codebookId}`,
-        `sourcePath: ${chunk.sourcePath}`,
-        `lines: ${chunk.startLine}-${chunk.endLine}`,
-        "",
-        trimmedContent,
-      ].join("\n");
-    })
-    .join("\n\n-----------------------------\n\n");
-}
-
-type CheckerResult = {
-  verdict: "supported" | "unsupported" | "partial";
-  final_answer: string | null;
-  explanation: string;
+// Map base codebooks -> their amendment codebooks
+const AMENDMENT_MAP: Record<string, string> = {
+  "irc-utah-2021": "utah-amendments",
+  // add more base->amendment mappings here as you grow
 };
 
-async function callAnswerModel(options: {
+type SourceRef = {
+  sourceId: number;
+  id: string;
+  codebookId: string;
+  sourcePath: string;
+  startLine: number;
+  endLine: number;
+};
+
+type AskResponse = {
+  ok: boolean;
   query: string;
-  context: string;
-}): Promise<string> {
-  const { query, context } = options;
+  codebookId: string;
+  answer: string | null;
+  sources: SourceRef[];
+  reason?: string;
+  error?: string;
+};
 
-  const systemPrompt = `
-You are an assistant that answers technical and legal questions strictly based on the building codes, standards, or regulations provided in the context.
+type AskRequestBody = {
+  query: string;
+  codebookId?: string;
+  topK?: number;
+};
 
-Global rules:
-1. You must rely ONLY on the supplied context excerpts (the retrieved chunks). Do not use external memory, outside knowledge, or assumptions.
-2. NEVER cite or reference code text that is not included in the provided context.
-3. If the provided context does not include enough information to answer safely and accurately, respond with: "I cannot answer that from the provided code sections."
-4. When providing an answer, cite using the format [source N, lines A-B].
-5. You do not assume which codebook the user is asking about. The codebookId and the context chunks determine the source.
-6. You are neutral and do not interpret laws beyond exactly what the text states. No extrapolation, no “common practice,” no guessing.
-7. Every answer must be grounded 100% in the retrieved chunks, regardless of which codebook or jurisdiction they came from.
-`.trim();
+/**
+ * Deduplicate chunks by id, keeping first occurrence.
+ */
+function dedupeChunks(chunks: IndexedChunk[]): IndexedChunk[] {
+  const seen = new Set<string>();
+  const result: IndexedChunk[] = [];
+  for (const c of chunks) {
+    if (seen.has(c.id)) continue;
+    seen.add(c.id);
+    result.push(c);
+  }
+  return result;
+}
 
-  const userPrompt = `
-User question:
-${query}
+/**
+ * Build a single big context string for the LLM, with numbered sources.
+ */
+function buildContextString(chunks: IndexedChunk[]): {
+  contextText: string;
+  sources: SourceRef[];
+} {
+  const lines: string[] = [];
+  const sources: SourceRef[] = [];
 
-Context from codebooks:
-${context}
+  chunks.forEach((chunk, idx) => {
+    const sourceId = idx + 1;
+    lines.push(
+      `[source ${sourceId}, lines ${chunk.startLine}-${chunk.endLine}] (codebook: ${chunk.codebookId}, path: ${chunk.sourcePath})\n${chunk.content.trim()}\n`
+    );
 
-Instructions:
-1. Answer the question using ONLY the context above.
-2. When you make a claim, reference the relevant source(s) like [source 1, lines 4965-4981].
-3. If the context does not support a safe, accurate answer, explicitly say: "I cannot answer that from the provided code sections."
-`.trim();
-
-  const completion = await openai.chat.completions.create({
-    model: "gpt-5-mini",
-    temperature: 1,
-    messages: [
-      { role: "system", content: systemPrompt },
-      { role: "user", content: userPrompt },
-    ],
+    sources.push({
+      sourceId,
+      id: chunk.id,
+      codebookId: chunk.codebookId,
+      sourcePath: chunk.sourcePath,
+      startLine: chunk.startLine,
+      endLine: chunk.endLine,
+    });
   });
 
-  return completion.choices[0]?.message?.content ?? "";
+  return {
+    contextText: lines.join("\n"),
+    sources,
+  };
 }
 
-async function callCheckerModel(options: {
-  query: string;
-  context: string;
-  draftAnswer: string;
-}): Promise<CheckerResult> {
-  const { query, context, draftAnswer } = options;
-
-  const systemPrompt = `
-You are a strict verification model for building codes and legal text.
-
-Your job:
-- Verify whether the DRAFT ANSWER is fully supported by the provided CONTEXT.
-- Do NOT add new claims beyond what appears in the context.
-- You MUST be conservative. When in doubt, treat content as unsupported.
-
-You must respond in EXACT JSON with keys:
-{
-  "verdict": "supported" | "unsupported" | "partial",
-  "final_answer": string or null,
-  "explanation": string
-}
-
-Definitions:
-- "supported": All key claims in the answer are directly supported by the context, and citations are consistent with the relevant sources.
-- "unsupported": The answer makes claims that are not supported by the context, or contradicts the text, or uses obvious external knowledge.
-- "partial": Some parts are supported, but other parts are not, or the answer is overly broad or needs tightening. In this case, you should produce a corrected, strictly-supported version of the answer in "final_answer".
-`.trim();
-
-  const userPrompt = `
-USER QUESTION:
-${query}
-
-CONTEXT (sources from codebooks):
-${context}
-
-DRAFT ANSWER (to verify):
-${draftAnswer}
-
-Tasks:
-1. Check every major claim and citation in the DRAFT ANSWER against the CONTEXT text.
-2. Decide on a verdict:
-   - "supported" if the answer is fully supported and safely grounded.
-   - "unsupported" if it contains hallucinations, external knowledge, or claims not backed by the context.
-   - "partial" if it is mostly correct but includes unsupported or overreaching parts.
-3. If "supported":
-   - Set "final_answer" to the original DRAFT ANSWER.
-4. If "partial":
-   - Write a corrected, shorter, strictly-supported answer in "final_answer" using ONLY the context.
-5. If "unsupported":
-   - Set "final_answer" to null and explain briefly why.
-6. Respond with EXACT JSON, no extra text.
-`.trim();
-
-  const completion = await openai.chat.completions.create({
-    model: "gpt-5",
-    temperature: 1,
-    messages: [
-      { role: "system", content: systemPrompt },
-      { role: "user", content: userPrompt },
-    ],
-  });
-
-  const raw = completion.choices[0]?.message?.content ?? "{}";
-
-  let parsed: CheckerResult;
-  try {
-    parsed = JSON.parse(raw) as CheckerResult;
-  } catch (e) {
-    // If the checker doesn't return valid JSON, fail closed
-    return {
-      verdict: "unsupported",
-      final_answer: null,
-      explanation:
-        "Checker model returned invalid JSON. Failing closed for safety.",
-    };
+/**
+ * Try to parse JSON out of a model response, tolerating extra text / markdown.
+ */
+function parseJsonFromText(text: string): any {
+  const first = text.indexOf("{");
+  const last = text.lastIndexOf("}");
+  if (first === -1 || last === -1 || last <= first) {
+    throw new Error("No JSON object found in checker output");
   }
-
-  // Basic sanity check
-  if (
-    parsed.verdict !== "supported" &&
-    parsed.verdict !== "unsupported" &&
-    parsed.verdict !== "partial"
-  ) {
-    return {
-      verdict: "unsupported",
-      final_answer: null,
-      explanation:
-        "Checker model returned an invalid verdict. Failing closed for safety.",
-    };
-  }
-
-  return parsed;
+  const jsonStr = text.slice(first, last + 1);
+  return JSON.parse(jsonStr);
 }
 
+// ------------------------------------------
+// Main handler
+// ------------------------------------------
 export async function POST(request: Request) {
   try {
-    const body = await request.json();
+    const body = (await request.json()) as AskRequestBody;
 
-    const query: string = body.query;
-    const codebookId: string = body.codebookId || "icc-utah-2021";
-    const topK: number = body.topK || 6;
+    const query = (body.query || "").trim();
+    const baseCodebookId = body.codebookId || "irc-utah-2021";
+    const topK = body.topK ?? 6;
 
-    if (!query || typeof query !== "string") {
-      return NextResponse.json(
-        { error: "Missing or invalid 'query' field" },
-        { status: 400 }
-      );
+    if (!query) {
+      const res: AskResponse = {
+        ok: false,
+        query,
+        codebookId: baseCodebookId,
+        answer: null,
+        sources: [],
+        reason: "Missing or empty 'query' field.",
+      };
+      return NextResponse.json(res, { status: 400 });
     }
 
-    // 1) Retrieve relevant chunks from the embedded index
-    const chunks = await searchCodebook({
+    // --------------------------------------
+    // 1. Semantic retrieval: base codebook
+    // --------------------------------------
+    const baseChunks = await searchCodebook({
       query,
-      codebookId,
+      codebookId: baseCodebookId,
       topK,
     });
 
-    if (!chunks || chunks.length === 0) {
-      // Fail closed: no authoritative source found
-      return NextResponse.json(
-        {
-          ok: false,
+    // --------------------------------------
+    // 2. Semantic + structural retrieval: amendments
+    // --------------------------------------
+    const amendmentCodebookId = AMENDMENT_MAP[baseCodebookId];
+    let amendmentSemantic: IndexedChunk[] = [];
+    let amendmentStructural: IndexedChunk[] = [];
+
+    if (amendmentCodebookId) {
+      // Semantic search over amendments
+      try {
+        amendmentSemantic = await searchCodebook({
           query,
-          codebookId,
-          answer: null,
-          reason: "No relevant sections found in the codebook index.",
-        },
-        { status: 200 }
-      );
+          codebookId: amendmentCodebookId,
+          topK,
+        });
+      } catch (e) {
+        console.warn(
+          `Warning: semantic search for amendments failed for ${amendmentCodebookId}:`,
+          e
+        );
+      }
+
+      // Deterministic structural linking
+      let structRef: CodeStructureRef | null = null;
+      try {
+        structRef = extractStructureFromQuery(query);
+      } catch (e) {
+        console.warn("Warning: extractStructureFromQuery failed:", e);
+      }
+
+      console.log("ASK /api/ask structRef:", structRef);
+
+      if (structRef) {
+        try {
+          const allAmendmentChunks = loadCodebookIndex(amendmentCodebookId);
+          console.log(
+            "ASK loaded amendment chunks:",
+            allAmendmentChunks.length
+          );
+
+          amendmentStructural = findAmendmentChunksByStructure(structRef, {
+            amendmentChunks: allAmendmentChunks,
+            amendmentCodebookId,
+          });
+
+          console.log(
+            "ASK amendmentSemantic count:",
+            amendmentSemantic.length
+          );
+          console.log(
+            "ASK amendmentStructural count:",
+            amendmentStructural.length
+          );
+
+          if (amendmentStructural[0]) {
+            console.log(
+              "ASK first structural meta:",
+              (amendmentStructural[0] as any).meta
+            );
+            console.log(
+              "ASK first structural sourcePath:",
+              amendmentStructural[0].sourcePath
+            );
+          }
+        } catch (e) {
+          console.warn(
+            "Warning: findAmendmentChunksByStructure/loadCodebookIndex failed:",
+            e
+          );
+        }
+      }
     }
 
-    const context = buildContextFromChunks(chunks);
 
-    // 2) Call fast answer model
-    const draftAnswer = await callAnswerModel({ query, context });
+    // --------------------------------------
+    // 3. Merge chunks with priority:
+    //    structural amendments -> semantic amendments -> base code
+    // --------------------------------------
+    const mergedAmendments = dedupeChunks([
+      ...amendmentStructural,
+      ...amendmentSemantic,
+    ]);
 
-    // 3) Call strict checker model
-    const checker = await callCheckerModel({ query, context, draftAnswer });
+    const allChunks = dedupeChunks([...mergedAmendments, ...baseChunks]);
 
-    if (checker.verdict === "unsupported") {
-      // Fail closed
-      return NextResponse.json(
-        {
-          ok: false,
-          query,
-          codebookId,
-          answer: null,
-          reason:
-            "The checker model could not verify the answer against the provided code sections.",
-          checkerExplanation: checker.explanation,
-        },
-        { status: 200 }
-      );
-    }
-
-    const finalAnswer =
-      checker.verdict === "partial"
-        ? checker.final_answer
-        : draftAnswer || checker.final_answer;
-
-    if (!finalAnswer) {
-      return NextResponse.json(
-        {
-          ok: false,
-          query,
-          codebookId,
-          answer: null,
-          reason:
-            "No safe, supported answer could be produced from the provided code sections.",
-          checkerExplanation: checker.explanation,
-        },
-        { status: 200 }
-      );
-    }
-
-    return NextResponse.json(
-      {
-        ok: true,
-        query,
-        codebookId,
-        answer: finalAnswer,
-        checkerVerdict: checker.verdict,
-        checkerExplanation: checker.explanation,
-        sources: chunks.map((chunk, idx) => ({
-          sourceId: idx + 1,
-          id: chunk.id,
-          sourcePath: chunk.sourcePath,
-          startLine: chunk.startLine,
-          endLine: chunk.endLine,
-        })),
-      },
-      { status: 200 }
+    console.log(
+      "ASK mergedAmendments:",
+      mergedAmendments.length,
+      "baseChunks:",
+      baseChunks.length,
+      "allChunks:",
+      allChunks.length
     );
+
+    if (allChunks.length === 0) {
+      const res: AskResponse = {
+        ok: false,
+        query,
+        codebookId: baseCodebookId,
+        answer: null,
+        sources: [],
+        reason:
+          "I cannot answer that from the provided code sections (no relevant sections were retrieved).",
+      };
+      return NextResponse.json(res, { status: 200 });
+    }
+
+    // Optionally cap total number of chunks to avoid over-long prompts
+    const maxContextChunks = 12;
+    const contextChunks = allChunks.slice(0, maxContextChunks);
+
+    const { contextText, sources } = buildContextString(contextChunks);
+
+    // --------------------------------------
+    // 4. First-pass answer (answer model)
+    // --------------------------------------
+    const answerSystemPrompt = `
+You are an assistant that answers questions strictly from the provided building code sections.
+
+Rules:
+- Use ONLY the given sources; do NOT rely on general knowledge.
+- If the sources are insufficient, respond exactly with:
+  "I cannot answer that from the provided code sections."
+- When you can answer, include citations in the form:
+  [source N, lines A–B]
+- Do not invent new section numbers, titles, or legal requirements that are not clearly stated in the sources.
+- If amendments conflict with base code, prefer the amendment text (these are usually in the "utah-amendments" codebook).
+`.trim();
+
+    const answerUserPrompt = `
+User question:
+${query}
+
+You are given the following code sections:
+
+${contextText}
+
+Answer the user's question using ONLY these sections. If you cannot answer from them, say:
+"I cannot answer that from the provided code sections."
+`.trim();
+
+    const answerCompletion = await openai.chat.completions.create({
+      model: ANSWER_MODEL,
+      temperature: 0,
+      messages: [
+        {
+          role: "system",
+          content: answerSystemPrompt,
+        },
+        {
+          role: "user",
+          content: answerUserPrompt,
+        },
+      ],
+    });
+
+    const draftAnswer =
+      answerCompletion.choices[0]?.message?.content?.trim() || "";
+
+    if (
+      !draftAnswer ||
+      draftAnswer === "I cannot answer that from the provided code sections."
+    ) {
+      // Fail-closed directly
+      const res: AskResponse = {
+        ok: false,
+        query,
+        codebookId: baseCodebookId,
+        answer: null,
+        sources,
+        reason: "I cannot answer that from the provided code sections.",
+      };
+      return NextResponse.json(res, { status: 200 });
+    }
+
+    // --------------------------------------
+    // 5. Checker model: verify support
+    // --------------------------------------
+    const checkerSystemPrompt = `
+You are a strict verifier for building code answers.
+
+You will receive:
+- The user's question.
+- A set of numbered code sections.
+- A draft answer with citations.
+
+Your job:
+1. Decide whether EVERY factual statement in the answer is directly supported by the cited sources.
+2. If any part goes beyond the provided text, treat the whole answer as UNSUPPORTED.
+3. Prefer amendment code sections (e.g., from "utah-amendments") over base code if they conflict.
+
+Respond with a single JSON object only, no extra text, in one of these forms:
+
+If fully supported:
+{
+  "verdict": "supported",
+  "reason": "short explanation"
+}
+
+If not fully supported:
+{
+  "verdict": "unsupported",
+  "reason": "short explanation",
+  "fixed_answer": "a corrected answer that ONLY uses supported content, or the sentence 'I cannot answer that from the provided code sections.'"
+}
+`.trim();
+
+    const checkerUserPrompt = `
+Question:
+${query}
+
+Sources:
+${contextText}
+
+Draft answer:
+${draftAnswer}
+`.trim();
+
+    const checkerCompletion = await openai.chat.completions.create({
+      model: CHECKER_MODEL,
+      temperature: 0,
+      messages: [
+        {
+          role: "system",
+          content: checkerSystemPrompt,
+        },
+        {
+          role: "user",
+          content: checkerUserPrompt,
+        },
+      ],
+    });
+
+    const checkerRaw =
+      checkerCompletion.choices[0]?.message?.content?.trim() || "";
+
+    let verdict = "unsupported";
+    let checkerReason = "Checker returned invalid output; failing closed.";
+    let fixedAnswer: string | undefined;
+
+    try {
+      const parsed = parseJsonFromText(checkerRaw);
+      if (parsed && typeof parsed === "object") {
+        if (typeof parsed.verdict === "string") {
+          verdict = parsed.verdict;
+        }
+        if (typeof parsed.reason === "string") {
+          checkerReason = parsed.reason;
+        }
+        if (typeof parsed.fixed_answer === "string") {
+          fixedAnswer = parsed.fixed_answer;
+        }
+      }
+    } catch (e) {
+      console.warn("Failed to parse checker JSON:", e, "Raw:", checkerRaw);
+    }
+
+    if (verdict !== "supported") {
+      // Fail closed, prefer a corrected answer if the checker gave one
+      const finalAnswer =
+        fixedAnswer && fixedAnswer.trim().length > 0
+          ? fixedAnswer.trim()
+          : "I cannot answer that from the provided code sections.";
+
+      // Even if we provide a corrected answer, mark ok=false so the client
+      // understands this was not fully supported initially.
+      const res: AskResponse = {
+        ok: false,
+        query,
+        codebookId: baseCodebookId,
+        answer: finalAnswer,
+        sources,
+        reason: checkerReason || "The answer was not fully supported.",
+      };
+      return NextResponse.json(res, { status: 200 });
+    }
+
+    // Supported -> return the draft answer as final
+    const res: AskResponse = {
+      ok: true,
+      query,
+      codebookId: baseCodebookId,
+      answer: draftAnswer,
+      sources,
+    };
+    return NextResponse.json(res, { status: 200 });
   } catch (err: any) {
     console.error("Error in /api/ask:", err);
-    return NextResponse.json(
-      { error: err?.message || "Server error" },
-      { status: 500 }
-    );
+    const res: AskResponse = {
+      ok: false,
+      query: "",
+      codebookId: "",
+      answer: null,
+      sources: [],
+      error: err?.message || "Server error",
+    };
+    return NextResponse.json(res, { status: 500 });
   }
 }

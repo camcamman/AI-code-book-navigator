@@ -7,8 +7,8 @@ const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
 });
 
-const CODEBOOK_ID = "icc-utah-2021";
-const INPUT_TXT_PATH = path.join("codebooks", "raw", "ICC-Utah-Code-2021.txt");
+const CODEBOOK_ID = "irc-utah-2021";
+const INPUT_TXT_PATH = path.join("codebooks", "raw", "IRC-Utah-Code-2021.txt");
 const OUTPUT_INDEX_PATH = path.join(
   "codebooks",
   `${CODEBOOK_ID}.index.json`
