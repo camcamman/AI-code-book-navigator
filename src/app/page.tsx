@@ -6,7 +6,11 @@ import { useState } from "react";
 type SourceRef = {
   sourceId: number;
   id: string;
+  codebookId: string;
+  codebookLabel: string;
   sourcePath: string;
+  sectionLabel?: string;
+  publicUrl?: string;
   startLine: number;
   endLine: number;
 };
@@ -243,10 +247,29 @@ export default function HomePage() {
           </h3>
           <ul style={{ paddingLeft: "1.25rem", fontSize: "0.9rem" }}>
             {sources.map((s) => (
-              <li key={s.sourceId} style={{ marginBottom: "0.4rem" }}>
-                <strong>[source {s.sourceId}]</strong>{" "}
-                <code>{s.sourcePath}</code>, lines {s.startLine}-{s.endLine}
-              </li>
+              <li key={s.sourceId} style={{ marginBottom: "0.6rem" }}>
+                <div>
+                  <strong>[source {s.sourceId}] {s.codebookLabel}</strong>
+                </div>
+                {s.sectionLabel && (
+                  <div style={{ fontSize: "0.9rem" }}>{s.sectionLabel}</div>
+                )}
+                <div style={{ fontSize: "0.85rem", color: "#555" }}>
+                  {s.sourcePath}, lines {s.startLine}-{s.endLine}
+                </div>
+                {s.publicUrl && (
+                  <div style={{ fontSize: "0.85rem" }}>
+                    <a
+                      href={s.publicUrl}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      style={{ color: "#2563eb", textDecoration: "underline" }}
+                    >
+                      Open on code host
+                    </a>
+                  </div>
+                )}
+            </li>
             ))}
           </ul>
         </section>

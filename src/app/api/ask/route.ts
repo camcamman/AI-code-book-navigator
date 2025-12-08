@@ -30,7 +30,11 @@ type SourceRef = {
   sourceId: number;
   id: string;
   codebookId: string;
+  // Human-readable label for the codebook (optional)
+  codebookLabel?: string;
   sourcePath: string;
+  sectionLabel?: string;
+  publicUrl?: string;
   startLine: number;
   endLine: number;
 };
@@ -78,6 +82,28 @@ function buildContextString(chunks: IndexedChunk[]): {
 
   chunks.forEach((chunk, idx) => {
     const sourceId = idx + 1;
+    const meta: any = (chunk as any).meta || {};
+
+    const codebookDef = getCodebookDef(chunk.codebookId);
+    const codebookLabel = codebookDef?.label || chunk.codebookId;
+
+    // Try to build a human-readable section label from metadata if present
+    let sectionLabel: string | undefined;
+    if (meta.section) {
+      // Utah amendment style: title/chapter/section
+      if (meta.title && meta.chapter) {
+        sectionLabel = `Title ${meta.title} Chapter ${meta.chapter} Section ${meta.section}`;
+      } else {
+        sectionLabel = `Section ${meta.section}`;
+      }
+    } else if (meta.sectionId) {
+      // For IRC once we add sectionId in the indexer
+      sectionLabel = `Section ${meta.sectionId}`;
+    }
+
+    const publicUrl: string | undefined = meta.publicUrl || undefined;
+
+    // Context text stays as-is for the model:
     lines.push(
       `[source ${sourceId}, lines ${chunk.startLine}-${chunk.endLine}] (codebook: ${chunk.codebookId}, path: ${chunk.sourcePath})\n${chunk.content.trim()}\n`
     );
@@ -86,7 +112,10 @@ function buildContextString(chunks: IndexedChunk[]): {
       sourceId,
       id: chunk.id,
       codebookId: chunk.codebookId,
+      codebookLabel,
       sourcePath: chunk.sourcePath,
+      sectionLabel,
+      publicUrl,
       startLine: chunk.startLine,
       endLine: chunk.endLine,
     });
@@ -484,7 +513,7 @@ ${draftAnswer}
       sources,
     };
     return NextResponse.json(res, { status: 200 });
-    
+
   } catch (err: any) {
     console.error("Error in /api/ask:", err);
     const res: AskResponse = {

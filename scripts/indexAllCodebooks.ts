@@ -59,6 +59,17 @@ type CodebookConfig = CodebookConfigSingleFile | CodebookConfigMultiFile;
  * CONFIG: declare all codebooks you want to index here.
  * Adjust paths to match your actual folder layout.
  */
+// const CODEBOOKS: CodebookConfig[] = [
+//   {
+//     id: "irc-utah-2021",
+//     kind: "base",
+//     rawType: "single-file",
+//     rawPath: "codebooks/test/raw/IRC-Utah-Code-2021_test.txt",
+//     indexPath: "codebooks/test/output/IRC-utah-2021-test.index.json",
+//     maxCharsPerChunk: 2000,
+//   },
+// ];
+
 const CODEBOOKS: CodebookConfig[] = [
   {
   id: "irc-utah-2021",
@@ -87,6 +98,103 @@ const CODEBOOKS: CodebookConfig[] = [
   },
 ];
 
+type SectionMeta = {
+  codeSystem?: string;   // e.g. "IRC Utah 2021", "Utah Code", "Utah Amendments"
+  title?: string;        // e.g. "Title 10"
+  chapter?: string;      // e.g. "Chapter 3", "Chapter 9a", "Chapter 3-1"
+  sectionId?: string;    // e.g. "R302.2", "10-9a-101", "3-1-1.1"
+  sectionTitle?: string; // e.g. "Townhouse separation walls"
+  sectionLabel?: string; // e.g. "Section R302.2 – Townhouse separation walls"
+};
+
+/**
+ * Parse a SECTION header line of the form:
+ *
+ * SECTION: IRC Utah 2021 | Chapter 3 | Section R302.2 | Townhouse separation walls
+ * SECTION: Utah Code | Title 10 | Chapter 9a | Section 10-9a-101 | General provisions
+ * SECTION: Utah Amendments | Title 3 | Chapter 3-1 | Section 3-1-1.1 | ...
+ */
+/**
+ * Takes an entire file's text.
+ * If first line is a SECTION header, returns { meta, contentLines, headerLinesCount }.
+ * Otherwise, returns meta = null, contentLines = all lines, headerLinesCount = 0.
+ */
+function extractHeaderAndContent(
+  fileText: string
+): { meta: SectionMeta | null; contentLines: string[]; headerLinesCount: number } {
+  const lines = fileText.split(/\r?\n/);
+  if (lines.length === 0) {
+    return { meta: null, contentLines: [], headerLinesCount: 0 };
+  }
+
+  const first = lines[0];
+  if (!first.startsWith("SECTION:")) {
+    return { meta: null, contentLines: lines, headerLinesCount: 0 };
+  }
+
+  const meta = parseSectionHeader(first);
+  const contentLines = lines.slice(1); // skip header line for content
+
+  return { meta, contentLines, headerLinesCount: 1 };
+}
+
+// ---- END SECTION HEADER PARSING ----
+
+function parseSectionHeader(headerLine: string): SectionMeta | null {
+  const prefix = "SECTION:";
+  if (!headerLine.startsWith(prefix)) return null;
+
+  // Remove "SECTION:" and split on "|"
+  const parts = headerLine
+    .slice(prefix.length)
+    .split("|")
+    .map((p) => p.trim())
+    .filter(Boolean);
+
+  if (parts.length < 3) {
+    // Not enough structure to be useful
+    return null;
+  }
+
+  const meta: SectionMeta = {};
+
+  // parts[0] = code system/label ("IRC Utah 2021", "Utah Code", etc.)
+  meta.codeSystem = parts[0];
+
+  // parts[1] = something like "Chapter 3" or "Title 10" or "Title 10" for Utah Code
+  // parts[2] = something like "Section R302.2" or "Section 10-9a-101"
+  // parts[3] = optional title ("Townhouse separation walls")
+
+  // Handle simple patterns: "Title 10" / "Chapter 3" / "Chapter 9a" / "Title 3"
+  for (let i = 1; i < parts.length; i++) {
+    const p = parts[i];
+
+    if (/^Title\b/i.test(p)) {
+      meta.title = p; // keep full string "Title 10"
+    } else if (/^Chapter\b/i.test(p)) {
+      meta.chapter = p; // "Chapter 3-1"
+    } else if (/^Section\b/i.test(p)) {
+      meta.sectionId = p.replace(/^Section\s+/i, "").trim(); // "R302.2", "10-9a-101"
+    } else {
+      // Likely the section title / description
+      if (!meta.sectionTitle) {
+        meta.sectionTitle = p;
+      }
+    }
+  }
+
+  if (meta.sectionId) {
+    if (meta.sectionTitle) {
+      meta.sectionLabel = `Section ${meta.sectionId} – ${meta.sectionTitle}`;
+    } else {
+      meta.sectionLabel = `Section ${meta.sectionId}`;
+    }
+  }
+
+  return meta;
+}
+
+
 /**
  * Embedding helper.
  */
@@ -112,17 +220,21 @@ function chunkSingleFile(
   fullText: string,
   cfg: CodebookConfigSingleFile
 ): RawChunk[] {
-  const lines = fullText.split(/\r?\n/);
+  const { meta: headerMeta, contentLines, headerLinesCount } =
+    extractHeaderAndContent(fullText);
+
+  const lines = contentLines;
   const chunks: RawChunk[] = [];
 
   let currentLines: string[] = [];
   let currentCharCount = 0;
-  let chunkStartLine = 1;
+  // First content line is after the header, if present
+  let chunkStartLine = headerLinesCount + 1;
 
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
     const lineLength = line.length + 1; // +1 for newline
-    const lineNumber = i + 1;
+    const lineNumber = headerLinesCount + i + 1; // adjust for header
 
     if (
       currentLines.length > 0 &&
@@ -135,6 +247,7 @@ function chunkSingleFile(
         startLine: chunkStartLine,
         endLine: lineNumber - 1,
         content,
+        meta: headerMeta || undefined,
       });
 
       currentLines = [];
@@ -152,8 +265,9 @@ function chunkSingleFile(
       codebookId: cfg.id,
       sourcePath: cfg.rawPath,
       startLine: chunkStartLine,
-      endLine: lines.length,
+      endLine: headerLinesCount + lines.length,
       content,
+      meta: headerMeta || undefined,
     });
   }
 
@@ -203,19 +317,29 @@ function chunkMultiFile(
     const fullPath = path.join(cfg.rawDir, entry.name);
     const fullText = fs.readFileSync(fullPath, "utf8");
 
-    const lines = fullText.split(/\r?\n/);
-    const fileMeta = cfg.kind === "amendment"
-      ? parseAmendmentFilename(entry.name)
-      : {};
+    // 1) Extract SECTION header (if present)
+    const { meta: headerMeta, contentLines, headerLinesCount } =
+      extractHeaderAndContent(fullText);
+
+    const lines = contentLines;
+
+    // 2) Metadata from filename (used for amendments, etc.)
+    const fileMeta =
+      cfg.kind === "amendment" ? parseAmendmentFilename(entry.name) : {};
+
+    const combinedMeta = {
+      ...(headerMeta || {}),
+      ...(fileMeta || {}),
+    };
 
     let currentLines: string[] = [];
     let currentCharCount = 0;
-    let chunkStartLine = 1;
+    let chunkStartLine = headerLinesCount + 1;
 
     for (let i = 0; i < lines.length; i++) {
       const line = lines[i];
       const lineLength = line.length + 1;
-      const lineNumber = i + 1;
+      const lineNumber = headerLinesCount + i + 1;
 
       if (
         currentLines.length > 0 &&
@@ -228,7 +352,7 @@ function chunkMultiFile(
           startLine: chunkStartLine,
           endLine: lineNumber - 1,
           content,
-          meta: fileMeta,
+          meta: combinedMeta,
         });
 
         currentLines = [];
@@ -246,9 +370,9 @@ function chunkMultiFile(
         codebookId: cfg.id,
         sourcePath: fullPath,
         startLine: chunkStartLine,
-        endLine: lines.length,
+        endLine: headerLinesCount + lines.length,
         content,
-        meta: fileMeta,
+        meta: combinedMeta,
       });
     }
   }
