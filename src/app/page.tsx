@@ -1,5 +1,6 @@
 "use client";
 
+import { BASE_CODEBOOKS } from "@/lib/codebookRegistry";
 import { useState } from "react";
 
 type SourceRef = {
@@ -23,6 +24,7 @@ type AskResponse = {
 export default function HomePage() {
   const [query, setQuery] = useState("");
   const [codebookId, setCodebookId] = useState("irc-utah-2021");
+  const [includeAmendments, setIncludeAmendments] = useState(true);
   const [answer, setAnswer] = useState<string | null>(null);
   const [sources, setSources] = useState<SourceRef[]>([]);
   const [loading, setLoading] = useState(false);
@@ -50,6 +52,7 @@ export default function HomePage() {
           query: trimmed,
           codebookId,
           topK: 6,
+          includeAmendments,
         }),
       });
 
@@ -143,10 +146,29 @@ export default function HomePage() {
               fontSize: "0.95rem",
             }}
           >
-            <option value="irc-utah-2021">IRC Utah Code 2021</option>
-            {/* Add more options here later as you add more codebooks */}
+            {BASE_CODEBOOKS.map((cb) => (
+              <option key={cb.id} value={cb.id}>
+                {cb.label}
+              </option>
+            ))}
           </select>
         </label>
+
+        <label style={{ fontWeight: 500 }}>
+          Include Amendments
+          <input
+            type="checkbox"
+            checked={includeAmendments}
+            onChange={(e) => setIncludeAmendments(e.target.checked)}
+            style={{
+              marginLeft: "0.5rem",
+              transform: "scale(1.2)",
+              cursor: "pointer",
+            }}
+          />
+        </label>
+
+
 
         <button
           type="submit"

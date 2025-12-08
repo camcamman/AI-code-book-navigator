@@ -12,6 +12,10 @@ import {
   findAmendmentChunksByStructure,
   CodeStructureRef,
 } from "../../../lib/amendmentLinking";
+import {
+  AMENDMENT_MAP,
+  getCodebookDef,
+} from "../../../lib/codebookRegistry";
 
 const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
@@ -21,12 +25,6 @@ const ANSWER_MODEL =
   process.env.OPENAI_ANSWER_MODEL || "gpt-4.1-mini"; // set to gpt-5-mini if available
 const CHECKER_MODEL =
   process.env.OPENAI_CHECKER_MODEL || "gpt-4.1"; // set to gpt-5 if available
-
-// Map base codebooks -> their amendment codebooks
-const AMENDMENT_MAP: Record<string, string> = {
-  "irc-utah-2021": "utah-amendments",
-  // add more base->amendment mappings here as you grow
-};
 
 type SourceRef = {
   sourceId: number;
@@ -51,6 +49,7 @@ type AskRequestBody = {
   query: string;
   codebookId?: string;
   topK?: number;
+  includeAmendments?: boolean;
 };
 
 /**
@@ -123,6 +122,20 @@ export async function POST(request: Request) {
     const baseCodebookId = body.codebookId || "irc-utah-2021";
     const topK = body.topK ?? 6;
 
+    // Validate base codebook id against registry (must exist and not be an amendment)
+    const baseDef = getCodebookDef(baseCodebookId);
+    if (!baseDef || baseDef.isAmendment) {
+      const res: AskResponse = {
+        ok: false,
+        query,
+        codebookId: baseCodebookId,
+        answer: null,
+        sources: [],
+        reason: `Invalid base codebookId: ${baseCodebookId}`,
+      };
+      return NextResponse.json(res, { status: 400 });
+    }
+
     if (!query) {
       const res: AskResponse = {
         ok: false,
@@ -150,8 +163,10 @@ export async function POST(request: Request) {
     const amendmentCodebookId = AMENDMENT_MAP[baseCodebookId];
     let amendmentSemantic: IndexedChunk[] = [];
     let amendmentStructural: IndexedChunk[] = [];
+    const includeAmendments = body.includeAmendments ?? true;
 
-    if (amendmentCodebookId) {
+
+    if (amendmentCodebookId && includeAmendments) {
       // Semantic search over amendments
       try {
         amendmentSemantic = await searchCodebook({
@@ -174,40 +189,13 @@ export async function POST(request: Request) {
         console.warn("Warning: extractStructureFromQuery failed:", e);
       }
 
-      console.log("ASK /api/ask structRef:", structRef);
-
       if (structRef) {
         try {
           const allAmendmentChunks = loadCodebookIndex(amendmentCodebookId);
-          console.log(
-            "ASK loaded amendment chunks:",
-            allAmendmentChunks.length
-          );
-
           amendmentStructural = findAmendmentChunksByStructure(structRef, {
             amendmentChunks: allAmendmentChunks,
             amendmentCodebookId,
           });
-
-          console.log(
-            "ASK amendmentSemantic count:",
-            amendmentSemantic.length
-          );
-          console.log(
-            "ASK amendmentStructural count:",
-            amendmentStructural.length
-          );
-
-          if (amendmentStructural[0]) {
-            console.log(
-              "ASK first structural meta:",
-              (amendmentStructural[0] as any).meta
-            );
-            console.log(
-              "ASK first structural sourcePath:",
-              amendmentStructural[0].sourcePath
-            );
-          }
         } catch (e) {
           console.warn(
             "Warning: findAmendmentChunksByStructure/loadCodebookIndex failed:",
@@ -216,7 +204,6 @@ export async function POST(request: Request) {
         }
       }
     }
-
 
     // --------------------------------------
     // 3. Merge chunks with priority:
@@ -228,15 +215,6 @@ export async function POST(request: Request) {
     ]);
 
     const allChunks = dedupeChunks([...mergedAmendments, ...baseChunks]);
-
-    console.log(
-      "ASK mergedAmendments:",
-      mergedAmendments.length,
-      "baseChunks:",
-      baseChunks.length,
-      "allChunks:",
-      allChunks.length
-    );
 
     if (allChunks.length === 0) {
       const res: AskResponse = {
@@ -307,7 +285,6 @@ Answer the user's question using ONLY these sections. If you cannot answer from 
       !draftAnswer ||
       draftAnswer === "I cannot answer that from the provided code sections."
     ) {
-      // Fail-closed directly
       const res: AskResponse = {
         ok: false,
         query,
@@ -402,14 +379,11 @@ ${draftAnswer}
     }
 
     if (verdict !== "supported") {
-      // Fail closed, prefer a corrected answer if the checker gave one
       const finalAnswer =
         fixedAnswer && fixedAnswer.trim().length > 0
           ? fixedAnswer.trim()
           : "I cannot answer that from the provided code sections.";
 
-      // Even if we provide a corrected answer, mark ok=false so the client
-      // understands this was not fully supported initially.
       const res: AskResponse = {
         ok: false,
         query,
@@ -421,7 +395,6 @@ ${draftAnswer}
       return NextResponse.json(res, { status: 200 });
     }
 
-    // Supported -> return the draft answer as final
     const res: AskResponse = {
       ok: true,
       query,
