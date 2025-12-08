@@ -111,6 +111,68 @@ function parseJsonFromText(text: string): any {
   return JSON.parse(jsonStr);
 }
 
+function validateCitations(
+  answer: string,
+  sources: SourceRef[]
+): { ok: boolean; reason?: string } {
+  const text = answer || "";
+  const sourceById = new Map<number, SourceRef>();
+  for (const s of sources) {
+    sourceById.set(s.sourceId, s);
+  }
+
+  // Match patterns like:
+  // [source 1, lines 1–7]
+  // [source 2, lines 10-15]
+  const citationRegex =
+    /\[source\s+(\d+)\s*,\s*lines\s+(\d+)\s*[–\-]\s*(\d+)\]/gi;
+
+  let match: RegExpExecArray | null;
+  let foundAny = false;
+
+  while ((match = citationRegex.exec(text)) !== null) {
+    foundAny = true;
+
+    const sourceId = Number(match[1]);
+    const citedStart = Number(match[2]);
+    const citedEnd = Number(match[3]);
+
+    if (!Number.isFinite(sourceId) || !Number.isFinite(citedStart) || !Number.isFinite(citedEnd)) {
+      return {
+        ok: false,
+        reason: "Citation has non-numeric source or line range.",
+      };
+    }
+
+    const src = sourceById.get(sourceId);
+    if (!src) {
+      return {
+        ok: false,
+        reason: `Citation refers to unknown source ${sourceId}.`,
+      };
+    }
+
+    // Check that cited lines are within the chunk's line range
+    if (citedStart < src.startLine || citedEnd > src.endLine || citedStart > citedEnd) {
+      return {
+        ok: false,
+        reason: `Citation [source ${sourceId}, lines ${citedStart}–${citedEnd}] is outside the retrieved range (${src.startLine}–${src.endLine}).`,
+      };
+    }
+  }
+
+  // Require at least one citation in any supported answer
+  if (!foundAny) {
+    return {
+      ok: false,
+      reason: "Answer contains no citations.",
+    };
+  }
+
+  return { ok: true };
+}
+
+
 // ------------------------------------------
 // Main handler
 // ------------------------------------------
@@ -395,6 +457,25 @@ ${draftAnswer}
       return NextResponse.json(res, { status: 200 });
     }
 
+    // At this point the checker says "supported".
+    // Now enforce citation correctness.
+    const citationCheck = validateCitations(draftAnswer, sources);
+
+    if (!citationCheck.ok) {
+      const res: AskResponse = {
+        ok: false,
+        query,
+        codebookId: baseCodebookId,
+        answer: "I cannot answer that from the provided code sections.",
+        sources,
+        reason:
+          citationCheck.reason ||
+          "The answer's citations did not match the retrieved sources.",
+      };
+      return NextResponse.json(res, { status: 200 });
+    }
+
+    // Supported + citations valid -> return the draft answer as final
     const res: AskResponse = {
       ok: true,
       query,
@@ -403,6 +484,7 @@ ${draftAnswer}
       sources,
     };
     return NextResponse.json(res, { status: 200 });
+    
   } catch (err: any) {
     console.error("Error in /api/ask:", err);
     const res: AskResponse = {
