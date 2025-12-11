@@ -73,63 +73,117 @@ function dedupeChunks(chunks: IndexedChunk[]): IndexedChunk[] {
 /**
  * Build a single big context string for the LLM, with numbered sources.
  */
-function buildContextString(chunks: IndexedChunk[]): {
-  contextText: string;
-  sources: SourceRef[];
-} {
-  const lines: string[] = [];
-  const sources: SourceRef[] = [];
+  function buildContextString(chunks: IndexedChunk[]): {
+      contextText: string;
+      sources: SourceRef[];
+    } {
+      const lines: string[] = [];
+      const sources: SourceRef[] = [];
 
-  chunks.forEach((chunk, idx) => {
-    const sourceId = idx + 1;
-    const meta: any = (chunk as any).meta || {};
+      chunks.forEach((chunk, idx) => {
+        const sourceId = idx + 1;
+        const meta: any = (chunk as any).meta || {};
 
-    const codebookDef = getCodebookDef(chunk.codebookId);
-    const codebookLabel = codebookDef?.label || chunk.codebookId;
+        let sectionLabel: string | undefined;
 
-    // Try to build a human-readable section label from metadata if present
-    let sectionLabel: string | undefined;
-    if (meta.section) {
-      // Utah amendment style: title/chapter/section
-      if (meta.title && meta.chapter) {
-        sectionLabel = `Title ${meta.title} Chapter ${meta.chapter} Section ${meta.section}`;
-      } else {
-        sectionLabel = `Section ${meta.section}`;
-      }
-    } else if (meta.sectionId) {
-      // For IRC once we add sectionId in the indexer
-      sectionLabel = `Section ${meta.sectionId}`;
-    }
+        if (meta.sectionLabel) {
+          sectionLabel = meta.sectionLabel;
+        } else if (meta.section) {
+          if (meta.title && meta.chapter) {
+            sectionLabel = `Title ${meta.title} Chapter ${meta.chapter} Section ${meta.section}`;
+          } else {
+            sectionLabel = `Section ${meta.section}`;
+          }
+        } else if (meta.sectionId) {
+          sectionLabel = `Section ${meta.sectionId}`;
+        }
 
-    const publicUrl: string | undefined = meta.publicUrl || undefined;
+        const publicUrl = buildPublicUrlForSource(chunk.codebookId, meta);
 
-    // Context text stays as-is for the model:
-    lines.push(
-      `[source ${sourceId}, lines ${chunk.startLine}-${chunk.endLine}] (codebook: ${chunk.codebookId}, path: ${chunk.sourcePath})\n${chunk.content.trim()}\n`
-    );
+        // get human-friendly codebook label from registry, fall back to id
+        const codebookDef = getCodebookDef(chunk.codebookId);
+        const codebookLabel = codebookDef?.label ?? chunk.codebookId;
 
-    sources.push({
-      sourceId,
-      id: chunk.id,
-      codebookId: chunk.codebookId,
-      codebookLabel,
-      sourcePath: chunk.sourcePath,
-      sectionLabel,
-      publicUrl,
-      startLine: chunk.startLine,
-      endLine: chunk.endLine,
-    });
-  });
+        // Context text for the model
+        lines.push(
+          `[source ${sourceId}, lines ${chunk.startLine}-${chunk.endLine}] ` +
+            `(codebook: ${chunk.codebookId}, path: ${chunk.sourcePath})\n` +
+            `${chunk.content.trim()}\n`
+        );
 
-  return {
-    contextText: lines.join("\n"),
-    sources,
-  };
-}
+        // Struct for the frontend
+        sources.push({
+          sourceId,
+          id: chunk.id,
+          codebookId: chunk.codebookId,
+          codebookLabel,
+          sourcePath: chunk.sourcePath,
+          sectionLabel,
+          publicUrl,
+          startLine: chunk.startLine,
+          endLine: chunk.endLine,
+        });
+      });
+
+      return {
+        contextText: lines.join("\n"),
+        sources,
+      };
+  }
+
+
 
 /**
  * Try to parse JSON out of a model response, tolerating extra text / markdown.
  */
+function buildPublicUrlForSource(
+  codebookId: string,
+  meta: any
+): string | undefined {
+  // Utah statutory code (amendments)
+  if (codebookId === "utah-amendments") {
+    // 1) First preference: use the precomputed URL from the index
+    if (typeof meta?.publicUrl === "string" && meta.publicUrl.trim().length > 0) {
+      return meta.publicUrl.trim();
+    }
+
+    // 2) Fallback: old Solr search behavior, in case some chunks don't have publicUrl
+    let searchTerm: string | undefined =
+      typeof meta?.sectionLabel === "string"
+        ? meta.sectionLabel.trim()
+        : undefined;
+
+    if (!searchTerm && meta) {
+      if (meta.title && meta.chapter && meta.section) {
+        searchTerm = `Title ${meta.title} Chapter ${meta.chapter} Section ${meta.section}`;
+      } else if (meta.section) {
+        searchTerm = String(meta.section).trim();
+      }
+    }
+
+    if (searchTerm && searchTerm.length > 0) {
+      return `https://le.utah.gov/solrsearch.jsp?ktype=Code&request=${encodeURIComponent(
+        searchTerm
+      )}`;
+    }
+
+    return undefined;
+  }
+
+  // IRC Utah 2021 (base code) — keep exactly as you had it
+  if (codebookId === "irc-utah-2021") {
+    const sectionId = typeof meta?.sectionId === "string" ? meta.sectionId : "";
+    if (sectionId.startsWith("R3")) {
+      // Chapter 3 – Building Planning (R302.*, R303.*, etc.)
+      return "https://codes.iccsafe.org/content/IRC2021P3/chapter-3-building-planning";
+    }
+    // Fallback: main IRC 2021 content
+    return "https://codes.iccsafe.org/content/IRC2021P3";
+  }
+
+  return undefined;
+}
+
 function parseJsonFromText(text: string): any {
   const first = text.indexOf("{");
   const last = text.lastIndexOf("}");
@@ -154,7 +208,7 @@ function validateCitations(
   // [source 1, lines 1–7]
   // [source 2, lines 10-15]
   const citationRegex =
-    /\[source\s+(\d+)\s*,\s*lines\s+(\d+)\s*[–\-]\s*(\d+)\]/gi;
+  /source\s+(\d+)[^0-9]+(\d+)\s*[–-]\s*(\d+)/gi;
 
   let match: RegExpExecArray | null;
   let foundAny = false;
@@ -330,17 +384,39 @@ export async function POST(request: Request) {
     // 4. First-pass answer (answer model)
     // --------------------------------------
     const answerSystemPrompt = `
-You are an assistant that answers questions strictly from the provided building code sections.
+      You are an assistant that answers questions strictly from the provided building code sections.
 
-Rules:
-- Use ONLY the given sources; do NOT rely on general knowledge.
-- If the sources are insufficient, respond exactly with:
-  "I cannot answer that from the provided code sections."
-- When you can answer, include citations in the form:
-  [source N, lines A–B]
-- Do not invent new section numbers, titles, or legal requirements that are not clearly stated in the sources.
-- If amendments conflict with base code, prefer the amendment text (these are usually in the "utah-amendments" codebook).
-`.trim();
+      You MUST adhere to these citation rules:
+
+      - Only cite sources that appear in the CONTEXT section.
+      - Each source is labeled as: [source N, lines A–B].
+      - When you cite, you MUST keep line ranges within the exact A–B shown for that source.
+      - Do NOT invent or extend line ranges beyond what is shown.
+      - If the context shows [source 8, lines 2–8], you may cite:
+          [source 8, lines 2–8]
+          [source 8, lines 2–4]
+          [source 8, lines 5–8]
+        but NOT [source 8, lines 1–8] or [source 8, lines 8–16].
+      - N, A, and B in your citations MUST match the numbers shown in the CONTEXT section. Do not introduce new source numbers or line ranges that are not present there.
+      - If you are unsure which lines to use, default to the full range given for that source.
+      - If you cannot answer the question from the provided context, say:
+          "I cannot answer that from the provided code sections."
+        and do not guess or invent citations.
+
+      Hard rules:
+      1) Use ONLY the given sources; do NOT rely on general knowledge.
+      2) If the sources are insufficient, respond EXACTLY with:
+        "I cannot answer that from the provided code sections."
+        Do not add any other text in that case.
+      3) When you give an answer (i.e., not the failure sentence), you MUST include at least one citation in the form:
+        [source N, lines A–B]
+        - N must match one of the provided source numbers.
+        - A and B must be within that source's line range.
+      4) Every factual statement that depends on the code should be supported by at least one citation. You can place a citation at the end of the sentence or paragraph that it supports.
+      5) Do NOT invent new section numbers, titles, or legal requirements that are not clearly stated in the sources.
+      6) If amendments conflict with base code, prefer the amendment text (these are usually in the "utah-amendments" codebook).
+  `.trim();
+
 
     const answerUserPrompt = `
 User question:
@@ -391,33 +467,33 @@ Answer the user's question using ONLY these sections. If you cannot answer from 
     // 5. Checker model: verify support
     // --------------------------------------
     const checkerSystemPrompt = `
-You are a strict verifier for building code answers.
+    You are a strict verifier for building code answers.
 
-You will receive:
-- The user's question.
-- A set of numbered code sections.
-- A draft answer with citations.
+    You will receive:
+    - The user's question.
+    - A set of numbered code sections.
+    - A draft answer with citations.
 
-Your job:
-1. Decide whether EVERY factual statement in the answer is directly supported by the cited sources.
-2. If any part goes beyond the provided text, treat the whole answer as UNSUPPORTED.
-3. Prefer amendment code sections (e.g., from "utah-amendments") over base code if they conflict.
+    Your job:
+    1. Decide whether EVERY factual statement in the answer is directly supported by the cited sources.
+    2. If any part goes beyond the provided text, treat the whole answer as UNSUPPORTED.
+    3. Prefer amendment code sections (e.g., from "utah-amendments") over base code if they conflict.
 
-Respond with a single JSON object only, no extra text, in one of these forms:
+    Respond with a single JSON object only, no extra text, in one of these forms:
 
-If fully supported:
-{
-  "verdict": "supported",
-  "reason": "short explanation"
-}
+    If fully supported:
+    {
+      "verdict": "supported",
+      "reason": "short explanation"
+    }
 
-If not fully supported:
-{
-  "verdict": "unsupported",
-  "reason": "short explanation",
-  "fixed_answer": "a corrected answer that ONLY uses supported content, or the sentence 'I cannot answer that from the provided code sections.'"
-}
-`.trim();
+    If not fully supported:
+    {
+      "verdict": "unsupported",
+      "reason": "short explanation",
+      "fixed_answer": "a corrected answer that ONLY uses supported content, or the sentence 'I cannot answer that from the provided code sections.'"
+    }
+    `.trim();
 
     const checkerUserPrompt = `
 Question:

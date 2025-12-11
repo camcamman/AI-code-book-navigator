@@ -59,44 +59,30 @@ type CodebookConfig = CodebookConfigSingleFile | CodebookConfigMultiFile;
  * CONFIG: declare all codebooks you want to index here.
  * Adjust paths to match your actual folder layout.
  */
-// const CODEBOOKS: CodebookConfig[] = [
-//   {
-//     id: "irc-utah-2021",
-//     kind: "base",
-//     rawType: "single-file",
-//     rawPath: "codebooks/test/raw/IRC-Utah-Code-2021_test.txt",
-//     indexPath: "codebooks/test/output/IRC-utah-2021-test.index.json",
-//     maxCharsPerChunk: 2000,
-//   },
-// ];
-
 const CODEBOOKS: CodebookConfig[] = [
   {
-  id: "irc-utah-2021",
-  kind: "base",
-  rawType: "single-file",
-  rawPath: "codebooks/IRC-Utah-2021/raw/IRC-Utah-Code-2021.txt",
-  indexPath: "codebooks/IRC-Utah-2021/irc-utah-2021.index.json",
-  maxCharsPerChunk: 2000,
-},
+    id: "irc-utah-2021",
+    kind: "base",
+    rawType: "multi-file",
+    rawDir: "codebooks/IRC-Utah-2021/raw/sections",
+    indexPath: "codebooks/IRC-Utah-2021/irc-utah-2021.index.json",
+    maxCharsPerChunk: 2000,
+  },
 
   {
     id: "utah-amendments",
     kind: "amendment",
     rawType: "multi-file",
-    // Put all amendment .txt files into this directory:
-    // codebooks/utah-amendments/raw/*.txt
     rawDir: path.join("codebooks", "utah-amendments", "raw"),
     indexPath: path.join(
       "codebooks",
       "utah-amendments",
       "utah-amendments.index.json"
     ),
-    // Most amendment files are small; one chunk per file is fine.
-    // We still allow splitting if some files are huge.
     maxCharsPerChunk: 4000,
   },
 ];
+
 
 type SectionMeta = {
   codeSystem?: string;   // e.g. "IRC Utah 2021", "Utah Code", "Utah Amendments"
@@ -280,21 +266,91 @@ function chunkSingleFile(
  * This is optional metadata; we don't rely on it for search,
  * but it's useful for debugging and display.
  */
+/**
+ * Build the official Utah Legislature HTML URL for a section id.
+ *
+ * Examples:
+ *   "57-12-6"    -> https://le.utah.gov/xcode/Title57/Chapter12/57-12-S6.html
+ *   "78B-3-502"  -> https://le.utah.gov/xcode/Title78B/Chapter3/78B-3-S502.html
+ *   "57-22-5.1"  -> https://le.utah.gov/xcode/Title57/Chapter22/57-22-S5.1.html
+ */
+function buildUtahCodeSectionUrl(sectionId: string): string | null {
+  const parts = sectionId.split("-");
+
+  // Need at least: title-chapter-section
+  if (parts.length < 3) return null;
+
+  const [title, chapter, ...rest] = parts;
+  const tail = rest.join("-"); // e.g. "6", "502", "5.1"
+
+  // Utah pattern: {title}-{chapter}-S{tail}.html
+  //   57-12-6    -> 57-12-S6.html
+  //   78B-3-502  -> 78B-3-S502.html
+  //   57-22-5.1  -> 57-22-S5.1.html
+  const fileName = `${title}-${chapter}-S${tail}.html`;
+
+  return `https://le.utah.gov/xcode/Title${title}/Chapter${chapter}/${fileName}`;
+}
+
+/**
+ * Parse Utah amendment filenames of the form:
+ *   Title-57_Chapter-57-12_Section-57-12-6.txt
+ *   Title-78B_Chapter-78B-3_Section-78B-3-502.txt
+ *
+ * And produce the meta fields used everywhere else in the system.
+ */
 function parseAmendmentFilename(filename: string): Record<string, string> {
   const base = filename.replace(/\.txt$/i, "");
   const parts = base.split("_");
 
   const meta: Record<string, string> = {};
-  for (const part of parts) {
-    const [key, value] = part.split("-");
-    if (!key || value === undefined) continue;
 
-    const normalizedKey = key.toLowerCase(); // "title", "chapter", "section"
-    meta[normalizedKey] = value;
+  const titlePart = parts.find((p) => p.startsWith("Title-"));
+  const chapterPart = parts.find((p) => p.startsWith("Chapter-"));
+  const sectionPart = parts.find((p) => p.startsWith("Section-"));
+
+  if (!titlePart || !chapterPart || !sectionPart) {
+    return meta;
+  }
+
+  // Title-57       -> "57"
+  // Title-78B      -> "78B"
+  const titleNumber = titlePart.replace(/^Title-/, "");
+
+  // Chapter-57-12   -> raw "57-12"   -> chapterNumber "12"
+  // Chapter-78B-3   -> raw "78B-3"   -> chapterNumber "3"
+  const chapterRaw = chapterPart.replace(/^Chapter-/, "");
+  const chapterPieces = chapterRaw.split("-");
+  let chapterNumber: string;
+
+  if (chapterPieces.length < 2) {
+    // e.g. "12"
+    chapterNumber = chapterRaw;
+  } else {
+    // drop the title part, keep the rest
+    // "57-12"  -> ["57", "12"]     -> "12"
+    // "78B-3"  -> ["78B", "3"]     -> "3"
+    chapterNumber = chapterPieces.slice(1).join("-");
+  }
+
+  // Section-57-12-6     -> "57-12-6"
+  // Section-78B-3-502   -> "78B-3-502"
+  const sectionId = sectionPart.replace(/^Section-/, "");
+
+  // These keys match what the rest of your pipeline expects
+  meta.title = titleNumber;                           // "57"
+  meta.chapter = `${titleNumber}-${chapterNumber}`;   // "57-12"
+  meta.section = sectionId;                           // "57-12-6"
+  meta.sectionLabel = `Title ${titleNumber} Chapter ${chapterRaw} Section ${sectionId}`;
+
+  const publicUrl = buildUtahCodeSectionUrl(sectionId);
+  if (publicUrl) {
+    meta.publicUrl = publicUrl; // direct xcode URL
   }
 
   return meta;
 }
+
 
 /**
  * Chunk many small text files in a directory (amendments).
