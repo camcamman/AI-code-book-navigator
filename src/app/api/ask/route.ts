@@ -1,37 +1,27 @@
-// src/app/api/ask/route.ts
-
 import { NextResponse } from "next/server";
 import OpenAI from "openai";
-import {
-  searchCodebook,
-  loadCodebookIndex,
-  IndexedChunk,
-} from "../../../lib/searchCodebook";
-import {
-  extractStructureFromQuery,
-  findAmendmentChunksByStructure,
-  CodeStructureRef,
-} from "../../../lib/amendmentLinking";
-import {
-  AMENDMENT_MAP,
-  getCodebookDef,
-} from "../../../lib/codebookRegistry";
+import { searchCodebook, IndexedChunk } from "../../../lib/searchCodebook";
+import { AMENDMENT_MAP, getCodebookDef } from "../../../lib/codebookRegistry";
+export const runtime = "nodejs";
+
 
 const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
 });
 
-const ANSWER_MODEL =
-  process.env.OPENAI_ANSWER_MODEL || "gpt-4.1-mini"; // set to gpt-5-mini if available
-const CHECKER_MODEL =
-  process.env.OPENAI_CHECKER_MODEL || "gpt-4.1"; // set to gpt-5 if available
+type AskRequestBody = {
+  query: string;
+  codebookId?: string;
+  topK?: number;
+  includeAmendments?: boolean;
+  sessionId?: string;
+};
 
 type SourceRef = {
   sourceId: number;
   id: string;
   codebookId: string;
-  // Human-readable label for the codebook (optional)
-  codebookLabel?: string;
+  codebookLabel: string;
   sourcePath: string;
   sectionLabel?: string;
   publicUrl?: string;
@@ -49,237 +39,123 @@ type AskResponse = {
   error?: string;
 };
 
-type AskRequestBody = {
-  query: string;
-  codebookId?: string;
-  topK?: number;
-  includeAmendments?: boolean;
+const MAX_MEMORY_TURNS = 30;
+
+type MemoryEntry = {
+  role: "user" | "assistant";
+  query?: string;
+  answer?: string;
+  citations?: SourceRef[];
+  topicHint?: string;   // ← ADD THIS
+  timestamp: number;
 };
 
-/**
- * Deduplicate chunks by id, keeping first occurrence.
- */
-function dedupeChunks(chunks: IndexedChunk[]): IndexedChunk[] {
-  const seen = new Set<string>();
-  const result: IndexedChunk[] = [];
-  for (const c of chunks) {
-    if (seen.has(c.id)) continue;
-    seen.add(c.id);
-    result.push(c);
-  }
-  return result;
+const sessionMemory = new Map<string, MemoryEntry[]>();
+
+function looksUnderspecified(q: string): boolean {
+  const s = q.toLowerCase();
+
+  // Has a code-like identifier? (R302.2, 57-8-4.5, etc.)
+  const hasCodeLike =
+    /\b([a-z]\d{3,}(\.\d+)*)\b/i.test(s) || /\b\d{1,3}-\d{1,3}-\d+(\.\d+)?\b/.test(s);
+
+  // Follow-up / deictic language
+  const hasFollowup =
+    /\b(that|this|those|it|same|above|earlier|previous|that section|that chapter)\b/.test(s);
+
+  return !hasCodeLike && hasFollowup;
 }
 
-/**
- * Build a single big context string for the LLM, with numbered sources.
- */
-  function buildContextString(chunks: IndexedChunk[]): {
-      contextText: string;
-      sources: SourceRef[];
-    } {
-      const lines: string[] = [];
-      const sources: SourceRef[] = [];
-
-      chunks.forEach((chunk, idx) => {
-        const sourceId = idx + 1;
-        const meta: any = (chunk as any).meta || {};
-
-        let sectionLabel: string | undefined;
-
-        if (meta.sectionLabel) {
-          sectionLabel = meta.sectionLabel;
-        } else if (meta.section) {
-          if (meta.title && meta.chapter) {
-            sectionLabel = `Title ${meta.title} Chapter ${meta.chapter} Section ${meta.section}`;
-          } else {
-            sectionLabel = `Section ${meta.section}`;
-          }
-        } else if (meta.sectionId) {
-          sectionLabel = `Section ${meta.sectionId}`;
-        }
-
-        const publicUrl = buildPublicUrlForSource(chunk.codebookId, meta);
-
-        // get human-friendly codebook label from registry, fall back to id
-        const codebookDef = getCodebookDef(chunk.codebookId);
-        const codebookLabel = codebookDef?.label ?? chunk.codebookId;
-
-        // Context text for the model
-        lines.push(
-          `[source ${sourceId}, lines ${chunk.startLine}-${chunk.endLine}] ` +
-            `(codebook: ${chunk.codebookId}, path: ${chunk.sourcePath})\n` +
-            `${chunk.content.trim()}\n`
-        );
-
-        // Struct for the frontend
-        sources.push({
-          sourceId,
-          id: chunk.id,
-          codebookId: chunk.codebookId,
-          codebookLabel,
-          sourcePath: chunk.sourcePath,
-          sectionLabel,
-          publicUrl,
-          startLine: chunk.startLine,
-          endLine: chunk.endLine,
-        });
-      });
-
-      return {
-        contextText: lines.join("\n"),
-        sources,
-      };
+function getLastUserQuery(history: { role: string; query?: string }[]): string | null {
+  for (let i = history.length - 1; i >= 0; i--) {
+    const h = history[i];
+    if (h.role === "user" && h.query && h.query.trim().length > 0) return h.query.trim();
   }
-
-
-
-/**
- * Try to parse JSON out of a model response, tolerating extra text / markdown.
- */
-function buildPublicUrlForSource(
-  codebookId: string,
-  meta: any
-): string | undefined {
-  // Utah statutory code (amendments)
-  if (codebookId === "utah-amendments") {
-    // 1) First preference: use the precomputed URL from the index
-    if (typeof meta?.publicUrl === "string" && meta.publicUrl.trim().length > 0) {
-      return meta.publicUrl.trim();
-    }
-
-    // 2) Fallback: old Solr search behavior, in case some chunks don't have publicUrl
-    let searchTerm: string | undefined =
-      typeof meta?.sectionLabel === "string"
-        ? meta.sectionLabel.trim()
-        : undefined;
-
-    if (!searchTerm && meta) {
-      if (meta.title && meta.chapter && meta.section) {
-        searchTerm = `Title ${meta.title} Chapter ${meta.chapter} Section ${meta.section}`;
-      } else if (meta.section) {
-        searchTerm = String(meta.section).trim();
-      }
-    }
-
-    if (searchTerm && searchTerm.length > 0) {
-      return `https://le.utah.gov/solrsearch.jsp?ktype=Code&request=${encodeURIComponent(
-        searchTerm
-      )}`;
-    }
-
-    return undefined;
-  }
-
-  // IRC Utah 2021 (base code) — keep exactly as you had it
-  if (codebookId === "irc-utah-2021") {
-    const sectionId = typeof meta?.sectionId === "string" ? meta.sectionId : "";
-    if (sectionId.startsWith("R3")) {
-      // Chapter 3 – Building Planning (R302.*, R303.*, etc.)
-      return "https://codes.iccsafe.org/content/IRC2021P3/chapter-3-building-planning";
-    }
-    // Fallback: main IRC 2021 content
-    return "https://codes.iccsafe.org/content/IRC2021P3";
-  }
-
-  return undefined;
+  return null;
 }
 
-function parseJsonFromText(text: string): any {
-  const first = text.indexOf("{");
-  const last = text.lastIndexOf("}");
-  if (first === -1 || last === -1 || last <= first) {
-    throw new Error("No JSON object found in checker output");
+function getLastTopicHint(history: MemoryEntry[]): string | null {
+  for (let i = history.length - 1; i >= 0; i--) {
+    const h = history[i];
+    if (
+      h.role === "assistant" &&
+      typeof h.topicHint === "string" &&
+      h.topicHint.trim().length > 0
+    ) {
+      return h.topicHint.trim();
+    }
   }
-  const jsonStr = text.slice(first, last + 1);
-  return JSON.parse(jsonStr);
+  return null;
 }
 
-function validateCitations(
-  answer: string,
-  sources: SourceRef[]
-): { ok: boolean; reason?: string } {
-  const text = answer || "";
-  const sourceById = new Map<number, SourceRef>();
-  for (const s of sources) {
-    sourceById.set(s.sourceId, s);
+function getSessionHistory(sessionId: string): MemoryEntry[] {
+  return sessionMemory.get(sessionId) ?? [];
+}
+
+function saveSessionHistory(sessionId: string, history: MemoryEntry[]) {
+  if (history.length > MAX_MEMORY_TURNS) {
+    history = history.slice(history.length - MAX_MEMORY_TURNS);
   }
+  sessionMemory.set(sessionId, history);
+}
 
-  // Match patterns like:
-  // [source 1, lines 1–7]
-  // [source 2, lines 10-15]
-  const citationRegex =
-  /source\s+(\d+)[^0-9]+(\d+)\s*[–-]\s*(\d+)/gi;
+// Build a single context string from chunks
+function buildContext(
+  chunks: IndexedChunk[]
+): { contextText: string; sources: SourceRef[] } {
+  const lines: string[] = [];
+  const sources: SourceRef[] = [];
 
-  let match: RegExpExecArray | null;
-  let foundAny = false;
+  chunks.forEach((chunk, idx) => {
+    const sourceId = idx + 1;
 
-  while ((match = citationRegex.exec(text)) !== null) {
-    foundAny = true;
+    const meta = (chunk as any).meta ?? {};
+    const sectionLabel: string | undefined =
+      typeof meta.sectionLabel === "string" ? meta.sectionLabel :
+      typeof meta.header === "string" ? meta.header :
+      typeof meta.sectionId === "string" ? meta.sectionId :
+      undefined;
 
-    const sourceId = Number(match[1]);
-    const citedStart = Number(match[2]);
-    const citedEnd = Number(match[3]);
+    const publicUrl: string | undefined =
+      typeof meta.publicUrl === "string" ? meta.publicUrl : undefined;
 
-    if (!Number.isFinite(sourceId) || !Number.isFinite(citedStart) || !Number.isFinite(citedEnd)) {
-      return {
-        ok: false,
-        reason: "Citation has non-numeric source or line range.",
-      };
-    }
+    const label = sectionLabel || chunk.sourcePath || `Source ${sourceId}`;
+    const header = `[source ${sourceId}, lines ${chunk.startLine}-${chunk.endLine}] ${label}`;
 
-    const src = sourceById.get(sourceId);
-    if (!src) {
-      return {
-        ok: false,
-        reason: `Citation refers to unknown source ${sourceId}.`,
-      };
-    }
+    lines.push(header);
+    lines.push(chunk.content);
+    lines.push("");
 
-    // Check that cited lines are within the chunk's line range
-    if (citedStart < src.startLine || citedEnd > src.endLine || citedStart > citedEnd) {
-      return {
-        ok: false,
-        reason: `Citation [source ${sourceId}, lines ${citedStart}–${citedEnd}] is outside the retrieved range (${src.startLine}–${src.endLine}).`,
-      };
-    }
-  }
+    sources.push({
+      sourceId,
+      id: chunk.id,
+      codebookId: chunk.codebookId,
+      codebookLabel: getCodebookDef(chunk.codebookId)?.label ?? chunk.codebookId,
+      sourcePath: chunk.sourcePath,
+      sectionLabel,
+      publicUrl,
+      startLine: chunk.startLine,
+      endLine: chunk.endLine,
+    });
+  });
 
-  // Require at least one citation in any supported answer
-  if (!foundAny) {
-    return {
-      ok: false,
-      reason: "Answer contains no citations.",
-    };
-  }
-
-  return { ok: true };
+  return { contextText: lines.join("\n"), sources };
 }
 
 
-// ------------------------------------------
-// Main handler
-// ------------------------------------------
 export async function POST(request: Request) {
   try {
     const body = (await request.json()) as AskRequestBody;
 
-    const query = (body.query || "").trim();
+    const rawQuery = body.query || "";
+    const query = rawQuery.trim();
     const baseCodebookId = body.codebookId || "irc-utah-2021";
     const topK = body.topK ?? 6;
+    const includeAmendments = body.includeAmendments ?? true;
 
-    // Validate base codebook id against registry (must exist and not be an amendment)
-    const baseDef = getCodebookDef(baseCodebookId);
-    if (!baseDef || baseDef.isAmendment) {
-      const res: AskResponse = {
-        ok: false,
-        query,
-        codebookId: baseCodebookId,
-        answer: null,
-        sources: [],
-        reason: `Invalid base codebookId: ${baseCodebookId}`,
-      };
-      return NextResponse.json(res, { status: 400 });
-    }
+    const rawSessionId =
+      typeof body.sessionId === "string" ? body.sessionId.trim() : "";
+    const sessionId = rawSessionId.length > 0 ? rawSessionId : null;
 
     if (!query) {
       const res: AskResponse = {
@@ -293,309 +169,168 @@ export async function POST(request: Request) {
       return NextResponse.json(res, { status: 400 });
     }
 
-    // --------------------------------------
-    // 1. Semantic retrieval: base codebook
-    // --------------------------------------
-    const baseChunks = await searchCodebook({
-      query,
-      codebookId: baseCodebookId,
-      topK,
-    });
-
-    // --------------------------------------
-    // 2. Semantic + structural retrieval: amendments
-    // --------------------------------------
-    const amendmentCodebookId = AMENDMENT_MAP[baseCodebookId];
-    let amendmentSemantic: IndexedChunk[] = [];
-    let amendmentStructural: IndexedChunk[] = [];
-    const includeAmendments = body.includeAmendments ?? true;
-
-
-    if (amendmentCodebookId && includeAmendments) {
-      // Semantic search over amendments
-      try {
-        amendmentSemantic = await searchCodebook({
-          query,
-          codebookId: amendmentCodebookId,
-          topK,
-        });
-      } catch (e) {
-        console.warn(
-          `Warning: semantic search for amendments failed for ${amendmentCodebookId}:`,
-          e
-        );
-      }
-
-      // Deterministic structural linking
-      let structRef: CodeStructureRef | null = null;
-      try {
-        structRef = extractStructureFromQuery(query);
-      } catch (e) {
-        console.warn("Warning: extractStructureFromQuery failed:", e);
-      }
-
-      if (structRef) {
-        try {
-          const allAmendmentChunks = loadCodebookIndex(amendmentCodebookId);
-          amendmentStructural = findAmendmentChunksByStructure(structRef, {
-            amendmentChunks: allAmendmentChunks,
-            amendmentCodebookId,
-          });
-        } catch (e) {
-          console.warn(
-            "Warning: findAmendmentChunksByStructure/loadCodebookIndex failed:",
-            e
-          );
-        }
-      }
-    }
-
-    // --------------------------------------
-    // 3. Merge chunks with priority:
-    //    structural amendments -> semantic amendments -> base code
-    // --------------------------------------
-    const mergedAmendments = dedupeChunks([
-      ...amendmentStructural,
-      ...amendmentSemantic,
-    ]);
-
-    const allChunks = dedupeChunks([...mergedAmendments, ...baseChunks]);
-
-    if (allChunks.length === 0) {
+    const baseDef = getCodebookDef(baseCodebookId);
+    if (!baseDef || baseDef.isAmendment) {
       const res: AskResponse = {
         ok: false,
         query,
         codebookId: baseCodebookId,
         answer: null,
         sources: [],
-        reason:
-          "I cannot answer that from the provided code sections (no relevant sections were retrieved).",
+        reason: `Invalid base codebookId: ${baseCodebookId}`,
       };
-      return NextResponse.json(res, { status: 200 });
+      return NextResponse.json(res, { status: 400 });
     }
 
-    // Optionally cap total number of chunks to avoid over-long prompts
-    const maxContextChunks = 12;
-    const contextChunks = allChunks.slice(0, maxContextChunks);
+    const history: MemoryEntry[] =
+  sessionId !== null ? getSessionHistory(sessionId) : [];
 
-    const { contextText, sources } = buildContextString(contextChunks);
+// ----------------------------
+// Context-aware retrieval query
+// ----------------------------
+let effectiveQuery = query;
 
-    // --------------------------------------
-    // 4. First-pass answer (answer model)
-    // --------------------------------------
-    const answerSystemPrompt = `
-      You are an assistant that answers questions strictly from the provided building code sections.
+// Prefer anchoring whenever the query does NOT contain a code-like identifier.
+const hasCodeLike =
+  /\b([a-z]\d{3,}(\.\d+)*)\b/i.test(query) ||
+  /\b\d{1,3}-\d{1,3}-\d+(\.\d+)?\b/.test(query);
 
-      You MUST adhere to these citation rules:
+if (!hasCodeLike && history.length > 0) {
+  const hint = getLastTopicHint(history) ?? getLastUserQuery(history);
+  if (hint) {
+  // Put the anchor FIRST so embeddings strongly weight it.
+  effectiveQuery = `${hint}\n\nFollow-up question:\n${query}`;
+}
 
-      - Only cite sources that appear in the CONTEXT section.
-      - Each source is labeled as: [source N, lines A–B].
-      - When you cite, you MUST keep line ranges within the exact A–B shown for that source.
-      - Do NOT invent or extend line ranges beyond what is shown.
-      - If the context shows [source 8, lines 2–8], you may cite:
-          [source 8, lines 2–8]
-          [source 8, lines 2–4]
-          [source 8, lines 5–8]
-        but NOT [source 8, lines 1–8] or [source 8, lines 8–16].
-      - N, A, and B in your citations MUST match the numbers shown in the CONTEXT section. Do not introduce new source numbers or line ranges that are not present there.
-      - If you are unsure which lines to use, default to the full range given for that source.
-      - If you cannot answer the question from the provided context, say:
-          "I cannot answer that from the provided code sections."
-        and do not guess or invent citations.
+}
 
-      Hard rules:
-      1) Use ONLY the given sources; do NOT rely on general knowledge.
-      2) If the sources are insufficient, respond EXACTLY with:
-        "I cannot answer that from the provided code sections."
-        Do not add any other text in that case.
-      3) When you give an answer (i.e., not the failure sentence), you MUST include at least one citation in the form:
-        [source N, lines A–B]
-        - N must match one of the provided source numbers.
-        - A and B must be within that source's line range.
-      4) Every factual statement that depends on the code should be supported by at least one citation. You can place a citation at the end of the sentence or paragraph that it supports.
-      5) Do NOT invent new section numbers, titles, or legal requirements that are not clearly stated in the sources.
-      6) If amendments conflict with base code, prefer the amendment text (these are usually in the "utah-amendments" codebook).
-  `.trim();
+// ----------------------------
+// Retrieve base + amendments
+// ----------------------------
+console.log("effectiveQuery:", effectiveQuery);
+console.log("history length:", history.length);
+console.log("effectiveQuery:", effectiveQuery);
+console.log("topicHint (last):", getLastTopicHint(history));
 
 
-    const answerUserPrompt = `
-User question:
-${query}
+const baseChunks = await searchCodebook({
+  query: effectiveQuery,
+  codebookId: baseCodebookId,
+  topK,
+});
 
-You are given the following code sections:
+let amendmentChunks: IndexedChunk[] = [];
+const amendmentCodebookId = AMENDMENT_MAP[baseCodebookId];
 
-${contextText}
-
-Answer the user's question using ONLY these sections. If you cannot answer from them, say:
-"I cannot answer that from the provided code sections."
-`.trim();
-
-    const answerCompletion = await openai.chat.completions.create({
-      model: ANSWER_MODEL,
-      temperature: 0,
-      messages: [
-        {
-          role: "system",
-          content: answerSystemPrompt,
-        },
-        {
-          role: "user",
-          content: answerUserPrompt,
-        },
-      ],
+if (amendmentCodebookId && includeAmendments) {
+  try {
+    amendmentChunks = await searchCodebook({
+      query: effectiveQuery,
+      codebookId: amendmentCodebookId,
+      topK,
     });
+  } catch (e) {
+    console.warn("Amendment search failed:", e);
+  }
+}
 
-    const draftAnswer =
-      answerCompletion.choices[0]?.message?.content?.trim() || "";
+const allChunks: IndexedChunk[] = [...amendmentChunks, ...baseChunks];
 
-    if (
-      !draftAnswer ||
-      draftAnswer === "I cannot answer that from the provided code sections."
-    ) {
-      const res: AskResponse = {
-        ok: false,
-        query,
-        codebookId: baseCodebookId,
-        answer: null,
-        sources,
-        reason: "I cannot answer that from the provided code sections.",
-      };
-      return NextResponse.json(res, { status: 200 });
-    }
+if (allChunks.length === 0) {
+  const res: AskResponse = {
+    ok: false,
+    query,
+    codebookId: baseCodebookId,
+    answer: null,
+    sources: [],
+    reason: "I cannot answer that from the provided code sections.",
+  };
+  return NextResponse.json(res, { status: 200 });
+}
 
-    // --------------------------------------
-    // 5. Checker model: verify support
-    // --------------------------------------
-    const checkerSystemPrompt = `
-    You are a strict verifier for building code answers.
+const { contextText, sources } = buildContext(allChunks);
 
-    You will receive:
-    - The user's question.
-    - A set of numbered code sections.
-    - A draft answer with citations.
+// ----------------------------
+// Build chat history messages
+// ----------------------------
+type ChatMsg = OpenAI.Chat.Completions.ChatCompletionMessageParam;
 
-    Your job:
-    1. Decide whether EVERY factual statement in the answer is directly supported by the cited sources.
-    2. If any part goes beyond the provided text, treat the whole answer as UNSUPPORTED.
-    3. Prefer amendment code sections (e.g., from "utah-amendments") over base code if they conflict.
+const historyMessages: ChatMsg[] = [];
+for (const entry of history) {
+  if (entry.role === "user" && entry.query) {
+    historyMessages.push({ role: "user", content: entry.query });
+  } else if (entry.role === "assistant" && entry.answer) {
+    historyMessages.push({ role: "assistant", content: entry.answer });
+  }
+}
 
-    Respond with a single JSON object only, no extra text, in one of these forms:
+// ----------------------------
+// Ask model (strict RAG)
+// ----------------------------
+const systemPrompt =
+  "You are an assistant that answers questions about building codes and statutes.\n" +
+  "You must answer strictly and only based on the provided code excerpts.\n" +
+  'If the excerpts are not sufficient to answer safely, say: "I cannot answer that from the provided code sections."\n' +
+  "When you do answer, cite sources using: [source N, lines A–B]\n";
 
-    If fully supported:
-    {
-      "verdict": "supported",
-      "reason": "short explanation"
-    }
+const userPrompt =
+  `User question:\n${query}\n\n` +
+  "Relevant code excerpts:\n" +
+  contextText +
+  "\nAnswer using ONLY these excerpts and cite them.";
 
-    If not fully supported:
-    {
-      "verdict": "unsupported",
-      "reason": "short explanation",
-      "fixed_answer": "a corrected answer that ONLY uses supported content, or the sentence 'I cannot answer that from the provided code sections.'"
-    }
-    `.trim();
+const messages: ChatMsg[] = [
+  { role: "system", content: systemPrompt },
+  ...historyMessages,
+  { role: "user", content: userPrompt },
+];
 
-    const checkerUserPrompt = `
-Question:
-${query}
+const completion = await openai.chat.completions.create({
+  model: "gpt-5.2",
+  messages,
+  temperature: 0,
+});
 
-Sources:
-${contextText}
+const answerText = completion.choices[0]?.message?.content ?? "";
 
-Draft answer:
-${draftAnswer}
-`.trim();
+// ----------------------------
+// Save memory + topic hint
+// ----------------------------
+const now = Date.now();
 
-    const checkerCompletion = await openai.chat.completions.create({
-      model: CHECKER_MODEL,
-      temperature: 0,
-      messages: [
-        {
-          role: "system",
-          content: checkerSystemPrompt,
-        },
-        {
-          role: "user",
-          content: checkerUserPrompt,
-        },
-      ],
-    });
+if (sessionId !== null) {
+  const topicHint =
+    sources[0]?.sectionLabel ||
+    sources[0]?.sourcePath ||
+    undefined;
 
-    const checkerRaw =
-      checkerCompletion.choices[0]?.message?.content?.trim() || "";
+  const updatedHistory: MemoryEntry[] = [
+    ...history,
+    { role: "user", query, timestamp: now },
+    { role: "assistant", answer: answerText, citations: sources, topicHint, timestamp: now },
+  ];
 
-    let verdict = "unsupported";
-    let checkerReason = "Checker returned invalid output; failing closed.";
-    let fixedAnswer: string | undefined;
+  saveSessionHistory(sessionId, updatedHistory);
+}
 
-    try {
-      const parsed = parseJsonFromText(checkerRaw);
-      if (parsed && typeof parsed === "object") {
-        if (typeof parsed.verdict === "string") {
-          verdict = parsed.verdict;
-        }
-        if (typeof parsed.reason === "string") {
-          checkerReason = parsed.reason;
-        }
-        if (typeof parsed.fixed_answer === "string") {
-          fixedAnswer = parsed.fixed_answer;
-        }
-      }
-    } catch (e) {
-      console.warn("Failed to parse checker JSON:", e, "Raw:", checkerRaw);
-    }
-
-    if (verdict !== "supported") {
-      const finalAnswer =
-        fixedAnswer && fixedAnswer.trim().length > 0
-          ? fixedAnswer.trim()
-          : "I cannot answer that from the provided code sections.";
-
-      const res: AskResponse = {
-        ok: false,
-        query,
-        codebookId: baseCodebookId,
-        answer: finalAnswer,
-        sources,
-        reason: checkerReason || "The answer was not fully supported.",
-      };
-      return NextResponse.json(res, { status: 200 });
-    }
-
-    // At this point the checker says "supported".
-    // Now enforce citation correctness.
-    const citationCheck = validateCitations(draftAnswer, sources);
-
-    if (!citationCheck.ok) {
-      const res: AskResponse = {
-        ok: false,
-        query,
-        codebookId: baseCodebookId,
-        answer: "I cannot answer that from the provided code sections.",
-        sources,
-        reason:
-          citationCheck.reason ||
-          "The answer's citations did not match the retrieved sources.",
-      };
-      return NextResponse.json(res, { status: 200 });
-    }
-
-    // Supported + citations valid -> return the draft answer as final
-    const res: AskResponse = {
-      ok: true,
-      query,
-      codebookId: baseCodebookId,
-      answer: draftAnswer,
-      sources,
-    };
-    return NextResponse.json(res, { status: 200 });
+// ----------------------------
+// Return response
+// ----------------------------
+const res: AskResponse = {
+  ok: true,
+  query,
+  codebookId: baseCodebookId,
+  answer: answerText,
+  sources,
+};
+return NextResponse.json(res, { status: 200 });
 
   } catch (err: any) {
     console.error("Error in /api/ask:", err);
     const res: AskResponse = {
       ok: false,
       query: "",
-      codebookId: "",
+      codebookId: "irc-utah-2021",
       answer: null,
       sources: [],
       error: err?.message || "Server error",

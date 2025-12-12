@@ -1,7 +1,8 @@
 "use client";
 
 import { BASE_CODEBOOKS } from "@/lib/codebookRegistry";
-import { useState } from "react";
+import { useState, useEffect } from "react";
+
 
 type SourceRef = {
   sourceId: number;
@@ -33,61 +34,94 @@ export default function HomePage() {
   const [sources, setSources] = useState<SourceRef[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [sessionId, setSessionId] = useState<string | null>(null);
 
-  async function handleSubmit(e: React.FormEvent) {
-    e.preventDefault();
 
-    const trimmed = query.trim();
-    if (!trimmed) {
-      setError("Please enter a question about the code.");
-      return;
-    }
 
-    setLoading(true);
-    setError(null);
-    setAnswer(null);
-    setSources([]);
+useEffect(() => {
+  // Only run on client
+  if (typeof window === "undefined") return;
 
-    try {
-      const res = await fetch("/api/ask", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          query: trimmed,
-          codebookId,
-          topK: 6,
-          includeAmendments,
-        }),
-      });
+  const key = "codebookSessionId";
+  const existing = window.localStorage.getItem(key);
 
-      if (!res.ok) {
-        const text = await res.text();
-        throw new Error(
-          `Request failed with status ${res.status}: ${text || "unknown error"}`
-        );
-      }
+  if (existing && existing.trim().length > 0) {
+    setSessionId(existing);
+  } else {
+    const id =
+      typeof crypto !== "undefined" && "randomUUID" in crypto
+        ? crypto.randomUUID()
+        : `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    window.localStorage.setItem(key, id);
+    setSessionId(id);
+  }
+}, []);
 
-      const data: AskResponse = await res.json();
 
-      if (!data.ok) {
-        setAnswer(null);
-        setSources([]);
-        setError(
-          data.reason ||
-            "The assistant could not answer from the provided code sections."
-        );
+    async function handleSubmit(e: React.FormEvent) {
+      e.preventDefault();
+
+      const trimmed = query.trim();
+      if (!trimmed) {
+        setError("Please enter a question about the code.");
         return;
       }
 
-      setAnswer(data.answer || null);
-      setSources(data.sources || []);
-    } catch (err: any) {
-      console.error("Error calling /api/ask:", err);
-      setError(err?.message || "Unexpected error calling /api/ask");
-    } finally {
-      setLoading(false);
+      if (!sessionId) {
+        setError("Session not initialized yet. Please try again.");
+        return;
+      }
+
+      setLoading(true);
+      setError(null);
+      setAnswer(null);
+      setSources([]);
+
+      try {
+        const res = await fetch("/api/ask", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            query: trimmed,
+            codebookId,          // <-- use this, not selectedCodebookId
+            topK: 6,
+            includeAmendments,
+            sessionId,           // <-- new field for memory
+          }),
+        });
+
+        if (!res.ok) {
+          const text = await res.text();
+          throw new Error(
+            `Request failed with status ${res.status}: ${text || "unknown error"}`
+          );
+        }
+
+        const data: AskResponse = await res.json();
+
+        if (!data.ok) {
+          setAnswer(null);
+          setSources([]);
+          setError(
+            data.reason ||
+              "The assistant could not answer from the provided code sections."
+          );
+          return;
+        }
+
+        setAnswer(data.answer || null);
+        setSources(data.sources || []);
+      } catch (err: any) {
+        console.error("Error calling /api/ask:", err);
+        setError(
+          err?.message ||
+            "An unexpected error occurred while calling the code navigator."
+        );
+      } finally {
+        setLoading(false);
+      }
     }
-  }
+
 
   return (
     <main
