@@ -3,7 +3,6 @@
 import { BASE_CODEBOOKS } from "@/lib/codebookRegistry";
 import { useState, useEffect } from "react";
 
-
 type SourceRef = {
   sourceId: number;
   id: string;
@@ -16,12 +15,27 @@ type SourceRef = {
   endLine: number;
 };
 
+type AmendmentRef = {
+  sourceId: number;
+  id: string;
+  codebookId: string;
+  codebookLabel: string;
+  sourcePath: string;
+  sectionLabel?: string;
+  publicUrl?: string;
+  startLine: number;
+  endLine: number;
+  citation: string;
+  fullText: string;
+};
+
 type AskResponse = {
   ok: boolean;
   query: string;
   codebookId: string;
   answer: string | null;
   sources: SourceRef[];
+  amendments: AmendmentRef[];
   reason?: string;
   error?: string;
 };
@@ -32,96 +46,98 @@ export default function HomePage() {
   const [includeAmendments, setIncludeAmendments] = useState(true);
   const [answer, setAnswer] = useState<string | null>(null);
   const [sources, setSources] = useState<SourceRef[]>([]);
+  const [amendments, setAmendments] = useState<AmendmentRef[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [sessionId, setSessionId] = useState<string | null>(null);
 
 
+  useEffect(() => {
+    // Only run on client
+    if (typeof window === "undefined") return;
 
-useEffect(() => {
-  // Only run on client
-  if (typeof window === "undefined") return;
+    const key = "codebookSessionId";
+    const existing = window.localStorage.getItem(key);
 
-  const key = "codebookSessionId";
-  const existing = window.localStorage.getItem(key);
-
-  if (existing && existing.trim().length > 0) {
-    setSessionId(existing);
-  } else {
-    const id =
-      typeof crypto !== "undefined" && "randomUUID" in crypto
-        ? crypto.randomUUID()
-        : `${Date.now()}-${Math.random().toString(36).slice(2)}`;
-    window.localStorage.setItem(key, id);
-    setSessionId(id);
-  }
-}, []);
+    if (existing && existing.trim().length > 0) {
+      setSessionId(existing);
+    } else {
+      const id =
+        typeof crypto !== "undefined" && "randomUUID" in crypto
+          ? crypto.randomUUID()
+          : `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+      window.localStorage.setItem(key, id);
+      setSessionId(id);
+    }
+  }, []);
 
 
     async function handleSubmit(e: React.FormEvent) {
-      e.preventDefault();
+    e.preventDefault();
 
-      const trimmed = query.trim();
-      if (!trimmed) {
-        setError("Please enter a question about the code.");
-        return;
-      }
-
-      if (!sessionId) {
-        setError("Session not initialized yet. Please try again.");
-        return;
-      }
-
-      setLoading(true);
-      setError(null);
-      setAnswer(null);
-      setSources([]);
-
-      try {
-        const res = await fetch("/api/ask", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            query: trimmed,
-            codebookId,          // <-- use this, not selectedCodebookId
-            topK: 6,
-            includeAmendments,
-            sessionId,           // <-- new field for memory
-          }),
-        });
-
-        if (!res.ok) {
-          const text = await res.text();
-          throw new Error(
-            `Request failed with status ${res.status}: ${text || "unknown error"}`
-          );
-        }
-
-        const data: AskResponse = await res.json();
-
-        if (!data.ok) {
-          setAnswer(null);
-          setSources([]);
-          setError(
-            data.reason ||
-              "The assistant could not answer from the provided code sections."
-          );
-          return;
-        }
-
-        setAnswer(data.answer || null);
-        setSources(data.sources || []);
-      } catch (err: any) {
-        console.error("Error calling /api/ask:", err);
-        setError(
-          err?.message ||
-            "An unexpected error occurred while calling the code navigator."
-        );
-      } finally {
-        setLoading(false);
-      }
+    const trimmed = query.trim();
+    if (!trimmed) {
+      setError("Please enter a question about the code.");
+      return;
     }
 
+    if (!sessionId) {
+      setError("Session not initialized yet. Please try again.");
+      return;
+    }
+
+    setLoading(true);
+    setError(null);
+    setAnswer(null);
+    setSources([]);
+    setAmendments([]);
+
+    try {
+      const res = await fetch("/api/ask", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          query: trimmed,
+          codebookId, // <-- use this, not selectedCodebookId
+          topK: 6,
+          includeAmendments,
+          sessionId, // <-- new field for memory
+        }),
+      });
+
+      if (!res.ok) {
+        const text = await res.text();
+        throw new Error(
+          `Request failed with status ${res.status}: ${text || "unknown error"}`
+        );
+      }
+
+      const data: AskResponse = await res.json();
+
+      if (!data.ok) {
+        setAnswer(null);
+        setSources([]);
+        setAmendments(data.amendments || []);
+        setError(
+          data.reason ||
+            "The assistant could not answer from the provided code sections."
+        );
+        return;
+      }
+
+      setAnswer(data.answer || null);
+      setSources(data.sources || []);
+      setAmendments(data.amendments || []);
+    } catch (err: any) {
+      console.error("Error calling /api/ask:", err);
+      setError(
+        err?.message ||
+          "An unexpected error occurred while calling the code navigator."
+      );
+    } finally {
+      setLoading(false);
+    }
+  }
 
   return (
     <main
@@ -206,8 +222,6 @@ useEffect(() => {
           />
         </label>
 
-
-
         <button
           type="submit"
           disabled={loading}
@@ -242,30 +256,82 @@ useEffect(() => {
       )}
 
       {answer && (
-        <section style={{ marginBottom: "1.5rem" }}>
-          <h2
-            style={{
-              fontSize: "1.25rem",
-              fontWeight: 600,
-              marginBottom: "0.5rem",
-            }}
-          >
-            Answer
-          </h2>
-          <div
-            style={{
-              whiteSpace: "pre-wrap",
-              lineHeight: 1.5,
-              fontSize: "0.95rem",
-              borderRadius: "4px",
-              border: "1px solid #ddd",
-              padding: "0.75rem",
-              backgroundColor: "#fafafa",
-            }}
-          >
-            {answer}
-          </div>
-        </section>
+        <>
+          <section style={{ marginBottom: "1.5rem" }}>
+            <h2
+              style={{
+                fontSize: "1.25rem",
+                fontWeight: 600,
+                marginBottom: "0.5rem",
+              }}
+            >
+              Answer
+            </h2>
+            <div
+              style={{
+                whiteSpace: "pre-wrap",
+                lineHeight: 1.5,
+                fontSize: "0.95rem",
+                borderRadius: "4px",
+                border: "1px solid #ddd",
+                padding: "0.75rem",
+                backgroundColor: "#fafafa",
+              }}
+            >
+              {answer}
+            </div>
+          </section>
+
+          <section style={{ marginBottom: "1.5rem" }}>
+            <h3
+              style={{
+                fontSize: "1.1rem",
+                fontWeight: 600,
+                marginBottom: "0.5rem",
+              }}
+            >
+              Related Amendments
+            </h3>
+            {amendments.length === 0 ? (
+              <div style={{ fontSize: "0.9rem", color: "#555" }}>
+                None found
+              </div>
+            ) : (
+              <ul style={{ paddingLeft: "1.2rem" }}>
+                {amendments.map((a) => (
+                  <li key={`${a.id}-${a.sourceId}`} style={{ marginBottom: "1rem" }}>
+                    <div>
+                      <strong>
+                        {a.citation} {a.sectionLabel || a.sourcePath}
+                      </strong>
+                    </div>
+                    {a.publicUrl && (
+                      <div style={{ fontSize: "0.85rem", marginTop: "0.15rem" }}>
+                        <a href={a.publicUrl} target="_blank" rel="noreferrer">
+                          View official text
+                        </a>
+                      </div>
+                    )}
+                    <pre
+                      style={{
+                        whiteSpace: "pre-wrap",
+                        lineHeight: 1.4,
+                        fontSize: "0.9rem",
+                        borderRadius: "4px",
+                        border: "1px solid #ddd",
+                        padding: "0.75rem",
+                        backgroundColor: "#f8fafc",
+                        marginTop: "0.5rem",
+                      }}
+                    >
+                      {a.fullText}
+                    </pre>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </section>
+        </>
       )}
 
       {sources.length > 0 && (
@@ -280,32 +346,29 @@ useEffect(() => {
             Sources used
           </h3>
           <ul style={{ paddingLeft: "1.2rem" }}>
-  {sources.map((s) => (
-            <li key={s.sourceId} style={{ marginBottom: "0.6rem" }}>
-              <div>
-                <strong>[source {s.sourceId}] {s.codebookLabel}</strong>
-              </div>
-              {s.sectionLabel && (
-                <div style={{ fontSize: "0.9rem" }}>{s.sectionLabel}</div>
-              )}
-              <div style={{ fontSize: "0.85rem", color: "#555" }}>
-                {s.sourcePath}, lines {s.startLine}-{s.endLine}
-              </div>
-              {s.publicUrl && (
-                <div style={{ fontSize: "0.85rem", marginTop: "0.15rem" }}>
-                  <a
-                    href={s.publicUrl}
-                    target="_blank"
-                    rel="noreferrer"
-                  >
-                    View official text
-                  </a>
+            {sources.map((s) => (
+              <li key={s.sourceId} style={{ marginBottom: "0.6rem" }}>
+                <div>
+                  <strong>
+                    [source {s.sourceId}] {s.codebookLabel}
+                  </strong>
                 </div>
-              )}
-            </li>
-          ))}
-        </ul>
-
+                {s.sectionLabel && (
+                  <div style={{ fontSize: "0.9rem" }}>{s.sectionLabel}</div>
+                )}
+                <div style={{ fontSize: "0.85rem", color: "#555" }}>
+                  {s.sourcePath}, lines {s.startLine}-{s.endLine}
+                </div>
+                {s.publicUrl && (
+                  <div style={{ fontSize: "0.85rem", marginTop: "0.15rem" }}>
+                    <a href={s.publicUrl} target="_blank" rel="noreferrer">
+                      View official text
+                    </a>
+                  </div>
+                )}
+              </li>
+            ))}
+          </ul>
         </section>
       )}
     </main>

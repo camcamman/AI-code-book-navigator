@@ -21,8 +21,8 @@ export const CODEBOOKS: CodebookDef[] = [
     isAmendment: false,
   },
   {
-    id: "utah-amendments",
-    label: "Utah Amendments",
+    id: "irc-utah-2021-amendments",
+    label: "IRC Utah 2021 Amendments",
     isAmendment: true,
     baseCodebookId: "irc-utah-2021",
   },

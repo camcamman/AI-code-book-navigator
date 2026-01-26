@@ -64,7 +64,7 @@ const CODEBOOKS: CodebookConfig[] = [
     id: "irc-utah-2021",
     kind: "base",
     rawType: "multi-file",
-    rawDir: "codebooks/IRC-Utah-2021/raw/sections",
+    rawDir: "codebooks/IRC-Utah-2021/raw",
     indexPath: "codebooks/IRC-Utah-2021/irc-utah-2021.index.json",
     maxCharsPerChunk: 2000,
   },
@@ -81,6 +81,18 @@ const CODEBOOKS: CodebookConfig[] = [
     ),
     maxCharsPerChunk: 4000,
   },
+  {
+    id: "irc-utah-2021-amendments",
+    kind: "amendment",
+    rawType: "multi-file",
+    rawDir: path.join("codebooks", "irc-utah-2021-amendments", "raw", "items"),
+    indexPath: path.join(
+      "codebooks",
+      "irc-utah-2021-amendments",
+      "irc-utah-2021-amendments.index.json"
+    ),
+    maxCharsPerChunk: 4000,
+  },
 ];
 
 
@@ -91,6 +103,8 @@ type SectionMeta = {
   sectionId?: string;    // e.g. "R302.2", "10-9a-101", "3-1-1.1"
   sectionTitle?: string; // e.g. "Townhouse separation walls"
   sectionLabel?: string; // e.g. "Section R302.2 – Townhouse separation walls"
+  targetSectionId?: string; // e.g. "R109.1.5" for IRC amendments
+  amendmentAction?: string; // e.g. "replace_section", "add_exception"
 };
 
 /**
@@ -150,6 +164,8 @@ function parseSectionHeader(headerLine: string): SectionMeta | null {
   // parts[1] = something like "Chapter 3" or "Title 10" or "Title 10" for Utah Code
   // parts[2] = something like "Section R302.2" or "Section 10-9a-101"
   // parts[3] = optional title ("Townhouse separation walls")
+  // For IRC amendments, parts can include:
+  //   "Item 6" | "Target R108.3" | "Op append_sentence"
 
   // Handle simple patterns: "Title 10" / "Chapter 3" / "Chapter 9a" / "Title 3"
   for (let i = 1; i < parts.length; i++) {
@@ -161,6 +177,10 @@ function parseSectionHeader(headerLine: string): SectionMeta | null {
       meta.chapter = p; // "Chapter 3-1"
     } else if (/^Section\b/i.test(p)) {
       meta.sectionId = p.replace(/^Section\s+/i, "").trim(); // "R302.2", "10-9a-101"
+    } else if (/^Target\b/i.test(p)) {
+      meta.targetSectionId = p.replace(/^Target\s+/i, "").trim();
+    } else if (/^Op\b/i.test(p)) {
+      meta.amendmentAction = p.replace(/^Op\s+/i, "").trim();
     } else {
       // Likely the section title / description
       if (!meta.sectionTitle) {

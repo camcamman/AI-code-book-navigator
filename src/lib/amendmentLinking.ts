@@ -12,6 +12,13 @@ export type CodeStructureRef = {
   section?: string;
 };
 
+export type AmendmentAction = "delete" | "replace" | "add" | "modify" | "unknown";
+
+export type AmendmentInfo = {
+  action: AmendmentAction;
+  targetSectionId: string | null;
+};
+
 /**
  * Normalize a string for comparison:
  * - to string
@@ -25,6 +32,107 @@ function normalize(val: unknown): string {
     // strip trailing punctuation that often appears in headings, like "3-1-1.1."
     .replace(/[.:;,\s]+$/, "")
     .toLowerCase();
+}
+
+export function normalizeIrcSectionId(raw: string): string | null {
+  const trimmed = String(raw || "").trim();
+  if (!trimmed) return null;
+  const cleaned = trimmed.replace(/[)\].,:;]+$/, "");
+  if (/^[0-9]/.test(cleaned)) {
+    return `R${cleaned}`;
+  }
+  if (/^[a-z]/.test(cleaned)) {
+    return cleaned[0].toUpperCase() + cleaned.slice(1);
+  }
+  return cleaned;
+}
+
+function extractTargetSectionIdFromText(text: string): string | null {
+  const match = text.match(/Section\s+([A-Za-z]?\d+(?:\.\d+)*[A-Za-z]?)/i);
+  if (!match || !match[1]) return null;
+  return normalizeIrcSectionId(match[1]);
+}
+
+function extractTargetSectionIdFromPath(sourcePath: string): string | null {
+  const base = String(sourcePath || "").split(/[\\/]/).pop() || "";
+  const parts = base.split("_");
+  for (const part of parts) {
+    const cleaned = part.replace(/\.txt$/i, "");
+    if (/^[A-Za-z]?\d+(?:\.\d+)*[A-Za-z]?$/.test(cleaned)) {
+      return normalizeIrcSectionId(cleaned);
+    }
+  }
+  return null;
+}
+
+function mapOpToAction(op: string): AmendmentAction {
+  const lower = String(op || "").toLowerCase();
+  if (lower.includes("replace")) return "replace";
+  if (lower.includes("delete")) return "delete";
+  if (lower.includes("add")) return "add";
+  if (lower.includes("modify")) return "modify";
+  return "unknown";
+}
+
+export function classifyAmendmentAction(text: string): AmendmentAction {
+  const lower = String(text || "").toLowerCase();
+  if (lower.includes("deleted and replaced") || lower.includes("amended to read as follows")) {
+    return "replace";
+  }
+  if (lower.includes("is deleted")) {
+    return "delete";
+  }
+  if (lower.includes("is added") || lower.includes("new exception is added")) {
+    return "add";
+  }
+  if (lower.includes("is modified") || lower.includes("modified by adding")) {
+    return "modify";
+  }
+  return "unknown";
+}
+
+export function getAmendmentInfo(chunk: IndexedChunk): AmendmentInfo {
+  const meta = (chunk as any).meta ?? {};
+  const metaTarget = meta.targetSectionId ?? meta.sectionId ?? null;
+  const targetFromMeta = metaTarget ? normalizeIrcSectionId(String(metaTarget)) : null;
+  const targetFromPath = extractTargetSectionIdFromPath(chunk.sourcePath);
+  const targetFromText = extractTargetSectionIdFromText(chunk.content || "");
+  const targetSectionId = targetFromMeta || targetFromPath || targetFromText;
+
+  let action: AmendmentAction = "unknown";
+  if (typeof meta.amendmentAction === "string" && meta.amendmentAction.trim()) {
+    action = mapOpToAction(meta.amendmentAction);
+  }
+  if (action === "unknown") {
+    action = classifyAmendmentAction(chunk.content || "");
+  }
+
+  if (meta && typeof meta === "object") {
+    meta.amendment = { action, targetSectionId };
+  }
+
+  return { action, targetSectionId };
+}
+
+export function collectAmendmentExclusions(chunks: IndexedChunk[]): {
+  excludedSectionIds: Set<string>;
+  failClosedNoBase: boolean;
+} {
+  const excludedSectionIds = new Set<string>();
+  let failClosedNoBase = false;
+
+  for (const chunk of chunks) {
+    const info = getAmendmentInfo(chunk);
+    if (info.action === "delete" || info.action === "replace") {
+      if (!info.targetSectionId) {
+        failClosedNoBase = true;
+      } else {
+        excludedSectionIds.add(info.targetSectionId);
+      }
+    }
+  }
+
+  return { excludedSectionIds, failClosedNoBase };
 }
 
 /**

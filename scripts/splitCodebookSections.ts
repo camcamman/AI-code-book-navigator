@@ -2,11 +2,15 @@
 
 import fs from "fs";
 import path from "path";
+import { fileURLToPath } from "url";
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
 type CodebookSplitConfig = {
   codebookId: string;
   codeSystemLabel: string;
-  inputPath: string;
+  rawDir: string;
   outputDir: string;
   /**
    * Optional chapter detector.
@@ -38,7 +42,7 @@ type CodebookSplitConfig = {
 const CODEBOOK_CONFIGS: Record<string, CodebookSplitConfig> = {
   /**
    * IRC Utah 2021 – single big file:
-   *   codebooks/IRC-Utah-2021/raw/IRC-Utah-Code-2021.txt
+   *   codebooks/IRC-Utah-2021/raw/<single .txt file>
    *
    * Sections look like:
    *   R302.2 Townhouse separation walls.
@@ -50,13 +54,15 @@ const CODEBOOK_CONFIGS: Record<string, CodebookSplitConfig> = {
   "irc-utah-2021": {
     codebookId: "irc-utah-2021",
     codeSystemLabel: "IRC Utah 2021",
-    inputPath: path.join(
+    rawDir: path.resolve(__dirname, "..", "codebooks", "IRC-Utah-2021", "raw"),
+    outputDir: path.resolve(
+      __dirname,
+      "..",
       "codebooks",
       "IRC-Utah-2021",
       "raw",
-      "IRC-Utah-Code-2021.txt"
+      "sections"
     ),
-    outputDir: path.join("codebooks", "IRC-Utah-2021", "raw", "sections"),
     chapterRegex: /^CHAPTER\s+(\d+)\b/i,
     sectionRegex: /^(R\d{3}(?:\.\d+)*)(?:\s+(.+))?$/,
     parseSection(match) {
@@ -72,8 +78,15 @@ const CODEBOOK_CONFIGS: Record<string, CodebookSplitConfig> = {
   "utah-state-code": {
     codebookId: "utah-state-code",
     codeSystemLabel: "Utah Code",
-    inputPath: path.join("codebooks", "utah-state-code", "raw", "Utah-Code.txt"),
-    outputDir: path.join("codebooks", "utah-state-code", "raw", "sections"),
+    rawDir: path.resolve(__dirname, "..", "codebooks", "utah-state-code", "raw"),
+    outputDir: path.resolve(
+      __dirname,
+      "..",
+      "codebooks",
+      "utah-state-code",
+      "raw",
+      "sections"
+    ),
     chapterRegex: /^Chapter\s+([0-9A-Za-z-]+)/i,
     sectionRegex: /^(\d+-\d+[a-zA-Z]?(?:-\d+)*)(?:\.\s*(.+))?$/,
     parseSection(match) {
@@ -97,15 +110,31 @@ function ensureDir(dir: string) {
 }
 
 function splitCodebook(config: CodebookSplitConfig) {
-  const { codeSystemLabel, inputPath, outputDir, chapterRegex, sectionRegex } =
+  const { codeSystemLabel, rawDir, outputDir, chapterRegex, sectionRegex } =
     config;
 
-  if (!fs.existsSync(inputPath)) {
-    throw new Error(`Input file not found: ${inputPath}`);
+  if (!fs.existsSync(rawDir)) {
+    throw new Error(`Raw directory not found at: ${rawDir}`);
   }
 
   ensureDir(outputDir);
 
+  const entries = fs.readdirSync(rawDir, { withFileTypes: true });
+  const txtFiles = entries
+    .filter((entry) => entry.isFile() && entry.name.toLowerCase().endsWith(".txt"))
+    .map((entry) => entry.name);
+
+  if (txtFiles.length === 0) {
+    throw new Error(`No .txt files found in raw directory: ${rawDir}`);
+  }
+
+  if (txtFiles.length > 1) {
+    throw new Error(
+      `Multiple .txt files found in raw directory ${rawDir}: ${txtFiles.join(", ")}`
+    );
+  }
+
+  const inputPath = path.resolve(rawDir, txtFiles[0]);
   const raw = fs.readFileSync(inputPath, "utf8");
   const lines = raw.split(/\r?\n/);
 
