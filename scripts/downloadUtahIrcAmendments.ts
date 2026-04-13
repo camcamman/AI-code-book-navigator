@@ -160,6 +160,18 @@ function normalizeText(text: string): string {
   return normalized.replace(/\n{3,}/g, "\n\n");
 }
 
+function stripPdfHeadersFooters(text: string): string {
+  const lines = text.split("\n");
+  const cleaned = lines.filter((line) => {
+    const trimmed = line.trim();
+    if (!trimmed) return true;
+    if (/^Page\s+\d+\b/i.test(trimmed)) return false;
+    if (/^Utah\s+Code\b/i.test(trimmed)) return false;
+    return true;
+  });
+  return cleaned.join("\n");
+}
+
 function isItemStart(line: string): boolean {
   return (
     /^\s*\(\d+\)\s*In\s+IRC,\s+Section/i.test(line) ||
@@ -324,7 +336,7 @@ async function main() {
     }
   }
 
-  const normalizedText = normalizeText(rawText);
+  const normalizedText = stripPdfHeadersFooters(normalizeText(rawText));
   console.log(`[extract] Extracted text length: ${normalizedText.length} chars`);
   if (normalizedText.length < 200) {
     console.warn("[extract] WARNING: Extracted text length < 200 chars");

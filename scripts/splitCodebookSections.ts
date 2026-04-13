@@ -39,6 +39,13 @@ type CodebookSplitConfig = {
 /**
  * CONFIG: add new codebooks here as you go.
  */
+const codebookDir = path.resolve(
+  __dirname,
+  "..",
+  "codebooks",
+  "IRC-Utah-2021"
+);
+
 const CODEBOOK_CONFIGS: Record<string, CodebookSplitConfig> = {
   /**
    * IRC Utah 2021 – single big file:
@@ -50,19 +57,12 @@ const CODEBOOK_CONFIGS: Record<string, CodebookSplitConfig> = {
    *
    * Chapters look like:
    *   CHAPTER 3 BUILDING PLANNING
-   */
+  */
   "irc-utah-2021": {
     codebookId: "irc-utah-2021",
     codeSystemLabel: "IRC Utah 2021",
-    rawDir: path.resolve(__dirname, "..", "codebooks", "IRC-Utah-2021", "raw"),
-    outputDir: path.resolve(
-      __dirname,
-      "..",
-      "codebooks",
-      "IRC-Utah-2021",
-      "raw",
-      "sections"
-    ),
+    rawDir: path.join(codebookDir, "raw"),
+    outputDir: path.join(codebookDir, "raw", "sections"),
     chapterRegex: /^CHAPTER\s+(\d+)\b/i,
     sectionRegex: /^(R\d{3}(?:\.\d+)*)(?:\s+(.+))?$/,
     parseSection(match) {
@@ -123,98 +123,225 @@ function splitCodebook(config: CodebookSplitConfig) {
   const txtFiles = entries
     .filter((entry) => entry.isFile() && entry.name.toLowerCase().endsWith(".txt"))
     .map((entry) => entry.name);
+  const sectionTxtFiles = txtFiles.filter((name) =>
+    name.toLowerCase().startsWith("section_")
+  );
+  const tableTxtFiles = txtFiles.filter((name) =>
+    name.toLowerCase().startsWith("table_")
+  );
+  const inputFiles = sectionTxtFiles.length > 0 ? sectionTxtFiles : txtFiles;
 
-  if (txtFiles.length === 0) {
+  if (inputFiles.length === 0) {
     throw new Error(`No .txt files found in raw directory: ${rawDir}`);
   }
 
-  if (txtFiles.length > 1) {
-    throw new Error(
-      `Multiple .txt files found in raw directory ${rawDir}: ${txtFiles.join(", ")}`
-    );
-  }
-
-  const inputPath = path.resolve(rawDir, txtFiles[0]);
-  const raw = fs.readFileSync(inputPath, "utf8");
-  const lines = raw.split(/\r?\n/);
-
-  let currentChapter: string | null = null;
-  let currentSectionId: string | null = null;
-  let currentSectionTitle: string | null = null;
-  let currentSectionLines: string[] = [];
   let sectionCount = 0;
+  let tableCount = 0;
 
-  function flushCurrentSection() {
-    if (!currentSectionId || currentSectionLines.length === 0) {
-      return;
+  for (const inputFile of inputFiles) {
+    const inputPath = path.resolve(rawDir, inputFile);
+    const raw = fs.readFileSync(inputPath, "utf8");
+    const lines = raw.split(/\r?\n/);
+
+    let currentChapter: string | null = null;
+    let currentSectionId: string | null = null;
+    let currentSectionTitle: string | null = null;
+    let currentSectionLines: string[] = [];
+
+    function flushCurrentSection() {
+      if (!currentSectionId || currentSectionLines.length === 0) {
+        return;
+      }
+
+      const chapterLabel = currentChapter
+        ? `Chapter ${currentChapter}`
+        : "Chapter ?";
+
+      const sectionTitle = currentSectionTitle || "(no title)";
+      const header = `SECTION: ${codeSystemLabel} | ${chapterLabel} | Section ${currentSectionId} | ${sectionTitle}`;
+
+      const fileBase = `${config.codebookId}-${currentSectionId}`;
+      const titleSlug = slugifyForFilename(sectionTitle);
+      const fileName = titleSlug
+        ? `${fileBase}_${titleSlug}.txt`
+        : `${fileBase}.txt`;
+
+      const outPath = path.join(outputDir, fileName);
+      const content = [header, ...currentSectionLines].join("\n");
+
+      fs.writeFileSync(outPath, content, "utf8");
+      sectionCount++;
+
+      currentSectionId = null;
+      currentSectionTitle = null;
+      currentSectionLines = [];
     }
 
-    const chapterLabel = currentChapter
-      ? `Chapter ${currentChapter}`
-      : "Chapter ?";
+    for (const line of lines) {
+      const trimmed = line.trim();
 
-    const sectionTitle = currentSectionTitle || "(no title)";
-    const header = `SECTION: ${codeSystemLabel} | ${chapterLabel} | Section ${currentSectionId} | ${sectionTitle}`;
+      // Track chapter headers if we have a chapter regex
+      if (chapterRegex) {
+        const chapMatch = trimmed.match(chapterRegex);
+        if (chapMatch) {
+          // For IRC, chapMatch[1] is like "3"
+          currentChapter = chapMatch[1];
+          continue;
+        }
+      }
 
-    const fileBase = `${config.codebookId}-${currentSectionId}`;
-    const titleSlug = slugifyForFilename(sectionTitle);
+      // Detect new section
+      const secMatch = trimmed.match(sectionRegex);
+      if (secMatch) {
+        // New section: flush previous one
+        flushCurrentSection();
+
+        const { sectionId, sectionTitle } = config.parseSection(secMatch);
+        currentSectionId = sectionId;
+        currentSectionTitle = sectionTitle;
+        currentSectionLines = [];
+
+        // Include this header line itself in the section body
+        currentSectionLines.push(line);
+        continue;
+      }
+
+      // If inside a section, accumulate lines
+      if (currentSectionId) {
+        currentSectionLines.push(line);
+      } else {
+        // Lines before first section are ignored for now (preamble).
+      }
+    }
+
+    // Flush last section
+    flushCurrentSection();
+  }
+
+  function parseTableFile(raw: string) {
+    const lines = raw.split(/\r?\n/);
+    let tableId = "";
+    let title = "";
+    const columns: string[] = [];
+    const rows: string[] = [];
+    const footnotes: string[] = [];
+    let mode: "title" | "columns" | "rows" | "footnotes" | null = null;
+    let currentRow: string | null = null;
+
+    function pushRow() {
+      if (currentRow) {
+        rows.push(currentRow.trim());
+        currentRow = null;
+      }
+    }
+
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (trimmed.startsWith("TABLE_ID:")) {
+        pushRow();
+        tableId = trimmed.slice("TABLE_ID:".length).trim();
+        mode = null;
+        continue;
+      }
+      if (trimmed.startsWith("TITLE:")) {
+        pushRow();
+        title = trimmed.slice("TITLE:".length).trim();
+        mode = title ? null : "title";
+        continue;
+      }
+      if (trimmed === "COLUMNS:") {
+        pushRow();
+        mode = "columns";
+        continue;
+      }
+      if (trimmed === "ROWS:") {
+        pushRow();
+        mode = "rows";
+        continue;
+      }
+      if (trimmed === "FOOTNOTES:") {
+        pushRow();
+        mode = "footnotes";
+        continue;
+      }
+
+      if (mode === "title") {
+        if (trimmed) {
+          title = trimmed;
+          mode = null;
+        }
+        continue;
+      }
+
+      if (trimmed.startsWith("- ")) {
+        const value = trimmed.slice(2).trim();
+        if (mode === "columns") {
+          columns.push(value);
+        } else if (mode === "rows") {
+          pushRow();
+          currentRow = value;
+        } else if (mode === "footnotes") {
+          footnotes.push(value);
+        }
+        continue;
+      }
+
+      if (mode === "rows" && trimmed) {
+        currentRow = currentRow ? `${currentRow} ${trimmed}` : trimmed;
+      }
+    }
+
+    pushRow();
+
+    return { tableId, title, columns, rows, footnotes };
+  }
+
+  for (const inputFile of tableTxtFiles) {
+    const inputPath = path.resolve(rawDir, inputFile);
+    const raw = fs.readFileSync(inputPath, "utf8");
+    const { tableId, title, columns, rows, footnotes } = parseTableFile(raw);
+
+    if (!tableId) {
+      continue;
+    }
+
+    const tableTitle = title || null;
+    const headerTitle = tableTitle || `Table ${tableId}`;
+    const header = `SECTION: ${codeSystemLabel} | Chapter ? | Section Table ${tableId} | ${headerTitle}`;
+
+    const contentLines: string[] = [];
+    contentLines.push(`TABLE ${tableId}${tableTitle ? ` — ${tableTitle}` : ""}`);
+    if (columns.length > 0) {
+      contentLines.push(`COLUMNS: ${columns.join(" | ")}`);
+    }
+    if (rows.length > 0) {
+      contentLines.push("ROWS:");
+      for (const row of rows) {
+        contentLines.push(`- ${row}`);
+      }
+    }
+    if (footnotes.length > 0) {
+      contentLines.push("FOOTNOTES:");
+      for (const note of footnotes) {
+        contentLines.push(`- ${note}`);
+      }
+    }
+
+    const fileBase = `${config.codebookId}-table-${tableId}`;
+    const titleSlug = slugifyForFilename(tableTitle || "");
     const fileName = titleSlug
       ? `${fileBase}_${titleSlug}.txt`
       : `${fileBase}.txt`;
 
     const outPath = path.join(outputDir, fileName);
-    const content = [header, ...currentSectionLines].join("\n");
+    const content = [header, ...contentLines].join("\n");
 
     fs.writeFileSync(outPath, content, "utf8");
-    sectionCount++;
-
-    currentSectionId = null;
-    currentSectionTitle = null;
-    currentSectionLines = [];
+    tableCount++;
   }
-
-  for (const line of lines) {
-    const trimmed = line.trim();
-
-    // Track chapter headers if we have a chapter regex
-    if (chapterRegex) {
-      const chapMatch = trimmed.match(chapterRegex);
-      if (chapMatch) {
-        // For IRC, chapMatch[1] is like "3"
-        currentChapter = chapMatch[1];
-        continue;
-      }
-    }
-
-    // Detect new section
-    const secMatch = trimmed.match(sectionRegex);
-    if (secMatch) {
-      // New section: flush previous one
-      flushCurrentSection();
-
-      const { sectionId, sectionTitle } = config.parseSection(secMatch);
-      currentSectionId = sectionId;
-      currentSectionTitle = sectionTitle;
-      currentSectionLines = [];
-
-      // Include this header line itself in the section body
-      currentSectionLines.push(line);
-      continue;
-    }
-
-    // If inside a section, accumulate lines
-    if (currentSectionId) {
-      currentSectionLines.push(line);
-    } else {
-      // Lines before first section are ignored for now (preamble).
-    }
-  }
-
-  // Flush last section
-  flushCurrentSection();
 
   console.log(
-    `Done. Wrote ${sectionCount} section file(s) to ${outputDir} from ${inputPath}`
+    `Done. Wrote ${sectionCount} section file(s) and ${tableCount} table file(s) to ${outputDir} from ${inputFiles.length} input file(s)`
   );
 }
 

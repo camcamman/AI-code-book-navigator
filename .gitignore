@@ -7,8 +7,9 @@ node_modules/
 .env.local
 .env.*.local
 
-# ignore the whole codebooks file as it will only get bigger and git does not like how big it is 
+# ignore the whole codebooks file as it will only get bigger and git does not like how big it is as well as tables which is the output of the codebooks file and is also very big and git does not like it
 codebooks/
+tables/
 
 # OS / Editor junk
 .DS_Store

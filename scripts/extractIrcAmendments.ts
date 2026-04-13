@@ -126,6 +126,18 @@ function normalizeText(text: string): string {
   return text.replace(/\r\n?/g, "\n").replace(/\f/g, "\n");
 }
 
+function stripPdfHeadersFooters(text: string): string {
+  const lines = text.split("\n");
+  const cleaned = lines.filter((line) => {
+    const trimmed = line.trim();
+    if (!trimmed) return true;
+    if (/^Page\s+\d+\b/i.test(trimmed)) return false;
+    if (/^Utah\s+Code\b/i.test(trimmed)) return false;
+    return true;
+  });
+  return cleaned.join("\n");
+}
+
 function normalizeSectionId(raw: string): string {
   let cleaned = raw.trim().replace(/[.,;:)\]]+$/, "");
   if (!cleaned) return cleaned;
@@ -361,7 +373,7 @@ function main() {
     console.warn("[extract] WARNING: Extracted text length < 200 chars");
   }
 
-  const items = splitIntoItems(rawText);
+  const items = splitIntoItems(stripPdfHeadersFooters(rawText));
   console.log(`[extract] Items detected: ${items.length}`);
 
   if (items.length === 0) {

@@ -34,6 +34,8 @@ export async function POST(request: Request) {
           sourcePath: chunk.sourcePath,
           startLine: chunk.startLine,
           endLine: chunk.endLine,
+          publicUrl:
+            typeof chunk.meta?.publicUrl === "string" ? chunk.meta.publicUrl : undefined,
           contentPreview: chunk.content.slice(0, 500), // avoid sending giant text blocks
         })),
       },

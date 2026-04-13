@@ -9,6 +9,82 @@ export interface UtahSectionMetadata {
   publicUrl: string | null;
 }
 
+function stripSubsectionSuffix(raw: string): string {
+  const noParens = raw.split("(")[0] || "";
+  return noParens.replace(/[^0-9A-Za-z.]+$/g, "").trim();
+}
+
+function buildSectionId(
+  title: string,
+  chapter: string,
+  section: string
+): string | null {
+  const t = title.trim();
+  const c = chapter.trim();
+  const s = stripSubsectionSuffix(section);
+  if (!t || !c || !s) return null;
+  return `${t}-${c}-${s}`;
+}
+
+/**
+ * Resolve a Utah code citation or label to the official xcode URL.
+ *
+ * Accepts inputs like:
+ * - "15A-3-202"
+ * - "15A-3-202(1)"
+ * - "Title 15A Chapter 3 Section 202"
+ * - "Title 57 Chapter 57-12 Section 57-12-6"
+ */
+export function resolveUtahCodeUrl(input: string): string | null {
+  if (!input || typeof input !== "string") return null;
+  const raw = input.trim();
+  if (!raw) return null;
+
+  // First: look for a full hyphenated citation (Title-Chapter-Section)
+  const hyphenMatch = raw.match(
+    /([0-9]+[A-Za-z]?)\s*-\s*([0-9A-Za-z]+)\s*-\s*([0-9A-Za-z.]+(?:\([^)]*\))*)/
+  );
+  if (hyphenMatch) {
+    const sectionId = buildSectionId(
+      hyphenMatch[1],
+      hyphenMatch[2],
+      hyphenMatch[3]
+    );
+    return sectionId ? buildUtahCodeSectionUrl(sectionId) : null;
+  }
+
+  // Fallback: parse "Title X Chapter Y Section Z" style labels
+  const titleMatch = raw.match(/Title\s+([0-9]+[A-Za-z]?)/i);
+  const chapterMatch = raw.match(/Chapter\s+([0-9A-Za-z-]+)/i);
+  const sectionMatch = raw.match(/Section\s+([0-9A-Za-z.\-]+(?:\([^)]*\))*)/i);
+
+  if (!titleMatch || !chapterMatch || !sectionMatch) {
+    return null;
+  }
+
+  const title = titleMatch[1];
+  let chapter = chapterMatch[1];
+  let section = sectionMatch[1];
+
+  // Normalize chapter/section if they include title prefix
+  if (chapter.startsWith(`${title}-`)) {
+    chapter = chapter.slice(title.length + 1);
+  }
+  if (section.startsWith(`${title}-${chapter}-`)) {
+    section = section.slice(`${title}-${chapter}-`.length);
+  } else if (section.startsWith(`${title}-`)) {
+    const rest = section.slice(title.length + 1);
+    if (rest.startsWith(`${chapter}-`)) {
+      section = rest.slice(chapter.length + 1);
+    } else {
+      section = rest;
+    }
+  }
+
+  const sectionId = buildSectionId(title, chapter, section);
+  return sectionId ? buildUtahCodeSectionUrl(sectionId) : null;
+}
+
 /**
  * Build the official Utah Legislature HTML URL for a section id.
  *

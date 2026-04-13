@@ -23,7 +23,7 @@ SECTION_TEXT_RE = re.compile(
 )
 CHAPTER_RE = re.compile(r"^CHAPTER\s+([A-Z0-9]+)\b", re.IGNORECASE)
 TABLE_LABEL_RE = re.compile(
-    r"^TABLE\s+([A-Z]{1,3}\d{3,4}(?:\.\d+)*(?:\([0-9A-Z]+\))?)\b\.?\s*(.*)?$",
+    r"^TABLE\s+([A-Z]{1,3}\d{3,4}(?:\.\d+)*(?:\s*\([0-9A-Z]+\))?)\.?\s*(.*)?$",
     re.IGNORECASE,
 )
 AMENDMENT_RE = re.compile(r"\b(?:UTAH|STATE|AMENDED|MODIFIED|AMENDMENTS)\b", re.IGNORECASE)
@@ -2272,7 +2272,7 @@ def find_table_label_for_bbox(
 
     line = chosen["line"]
     match = chosen["match"]
-    table_id = match.group(1).strip()
+    table_id = re.sub(r"\s+", "", match.group(1).strip())
     title = (match.group(2) or "").strip()
     continued = "CONTINUED" in line["text"].upper()
     if debug is not None:
@@ -2330,10 +2330,17 @@ def write_table(
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     filename = f"table_{table_id}.txt"
     path = OUTPUT_DIR / filename
+    if title.startswith("("):
+        caption = f"TABLE {table_id}{title}"
+    elif title:
+        caption = f"TABLE {table_id} {title}"
+    else:
+        caption = f"TABLE {table_id}"
     lines = [
         f"PDF_PAGE: {format_pdf_pages(pdf_pages)}",
         f"TABLE_ID: {table_id}",
         f"TITLE: {title}",
+        f"CAPTION: {caption}",
         "",
         "COLUMNS:",
     ]
@@ -2359,6 +2366,7 @@ def write_table(
         "pdf_pages": pdf_pages,
         "table_id": table_id,
         "title": title,
+        "caption": caption,
         "columns": columns,
         "rows": rows,
         "footnotes": footnotes,
@@ -2366,6 +2374,111 @@ def write_table(
     if metadata:
         meta.update(metadata)
     json_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+
+
+def load_existing_table(table_id: str) -> Optional[Dict]:
+    json_path = OUTPUT_DIR / f"table_{table_id}.json"
+    if not json_path.exists():
+        return None
+    try:
+        parsed = json.loads(json_path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    return parsed
+
+
+def write_table_merged_if_present(
+    table_id: str,
+    title: str,
+    pdf_pages: List[int],
+    columns: List[str],
+    rows: List[List[str]],
+    footnotes: List[str],
+    metadata: Optional[Dict] = None,
+    *,
+    merge_existing: bool = False,
+) -> None:
+    final_title = title
+    final_pdf_pages = list(pdf_pages)
+    final_columns = list(columns)
+    final_rows = [list(row) for row in rows]
+    final_footnotes = list(footnotes)
+    final_metadata = dict(metadata) if metadata else None
+
+    if merge_existing:
+        existing = load_existing_table(table_id)
+        if existing:
+            existing_pages = existing.get("pdf_pages") or []
+            if isinstance(existing_pages, list):
+                seen_pages = set()
+                merged_pages: List[int] = []
+                for page in [*existing_pages, *final_pdf_pages]:
+                    if isinstance(page, int) and page > 0 and page not in seen_pages:
+                        seen_pages.add(page)
+                        merged_pages.append(page)
+                final_pdf_pages = merged_pages
+
+            existing_columns = existing.get("columns") or []
+            if (
+                isinstance(existing_columns, list)
+                and existing_columns
+                and len(existing_columns) == len(final_columns)
+            ):
+                final_columns = [str(col) for col in existing_columns]
+
+            existing_rows = existing.get("rows") or []
+            if isinstance(existing_rows, list):
+                normalized_existing_rows = [
+                    [str(cell) for cell in row] for row in existing_rows if isinstance(row, list)
+                ]
+                final_rows = normalized_existing_rows + final_rows
+
+            existing_footnotes = existing.get("footnotes") or []
+            if isinstance(existing_footnotes, list):
+                merged_footnotes: List[str] = []
+                seen_notes = set()
+                for note in [*existing_footnotes, *final_footnotes]:
+                    note_text = str(note).strip()
+                    if note_text and note_text not in seen_notes:
+                        seen_notes.add(note_text)
+                        merged_footnotes.append(note_text)
+                final_footnotes = merged_footnotes
+
+            existing_title = existing.get("title")
+            if isinstance(existing_title, str):
+                existing_title = existing_title.strip()
+                if existing_title and "continued" not in existing_title.lower():
+                    final_title = existing_title
+
+            if final_metadata is None:
+                final_metadata = {}
+            for key, value in existing.items():
+                if key in {
+                    "pdf_pages",
+                    "table_id",
+                    "title",
+                    "caption",
+                    "columns",
+                    "rows",
+                    "footnotes",
+                }:
+                    continue
+                final_metadata.setdefault(key, value)
+
+            if final_metadata is not None and existing.get("metadata"):
+                final_metadata.setdefault("existing_metadata", existing.get("metadata"))
+
+    write_table(
+        table_id,
+        final_title,
+        final_pdf_pages,
+        final_columns,
+        final_rows,
+        final_footnotes,
+        final_metadata,
+    )
 
 
 def write_fallback_page(page_num: int, lines: List[str]) -> None:
@@ -2400,7 +2513,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--pdf",
         type=str,
-        default=str(OUTPUT_DIR / "2021_International_Residential_Code.pdf"),
+        default=str(OUTPUT_DIR / "source" / "2024_irc_2nd_printing.pdf"),
     )
     parser.add_argument("--out", type=str, default=str(OUTPUT_DIR))
     parser.add_argument("--page-start", type=int, default=None)
@@ -3033,7 +3146,7 @@ def main() -> int:
                         )
                         continue
 
-                    write_table(
+                    write_table_merged_if_present(
                         entry["table_id"],
                         entry["title"],
                         [page_num],
@@ -3041,6 +3154,7 @@ def main() -> int:
                         entry["rows"],
                         entry["footnotes"],
                         entry.get("metadata"),
+                        merge_existing=bool(entry.get("continued")),
                     )
                     tables_extracted += 1
 

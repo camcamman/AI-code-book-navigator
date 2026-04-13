@@ -20,6 +20,8 @@ const CODEBOOK_INDEX_PATHS: Record<string, string> = {
   "irc-utah-2021": "IRC-Utah-2021/irc-utah-2021.index.json",
   // Utah amendments index
   "utah-amendments": "utah-amendments/utah-amendments.index.json",
+  // IRC Utah 2021 amendments index
+  "irc-utah-2021-amendments": "irc-utah-2021-amendments/irc-utah-2021-amendments.index.json",
   // Add more as you introduce new codebooks:
   // "some-other-id": "Some-Other-Codebook/some-other-id.index.json",
 };
@@ -40,6 +42,72 @@ type CodebookIndexCache = {
 };
 
 const indexCache: CodebookIndexCache = {};
+
+function extractTableRef(query: string): string | null {
+  const match = (query || "").match(
+    /\btable\s+([A-Za-z]?\d+(?:\.\d+)*(?:\([0-9A-Za-z]+\))?)/i
+  );
+  return match?.[1] ? match[1].toUpperCase() : null;
+}
+
+function chunkStructuralBoost(chunk: IndexedChunk, query: string): number {
+  const meta = chunk.meta ?? {};
+  const tableRef = extractTableRef(query);
+  if (!tableRef) return 0;
+
+  const tableId =
+    typeof meta.tableId === "string" ? meta.tableId.toUpperCase() : "";
+  const caption =
+    typeof meta.caption === "string" ? meta.caption.toUpperCase() : "";
+  const content = String(chunk.content || "").toUpperCase();
+  const sourceBase = path
+    .basename(chunk.sourcePath || "", path.extname(chunk.sourcePath || ""))
+    .toUpperCase();
+  const sourceTableId = sourceBase.startsWith("TABLE_")
+    ? sourceBase.slice("TABLE_".length)
+    : "";
+  const baseTableRef = tableRef.replace(/\([0-9A-Z]+\)$/i, "");
+
+  if (tableId === tableRef) return 10;
+  if (caption.includes(`TABLE ${tableRef}`)) return 8;
+  if (content.includes(`TABLE ${tableRef}`)) return 6;
+  if (content.includes(`TABLE_ID: ${tableRef}`)) return 6;
+  if (sourceTableId === tableRef) return 6;
+  if (sourceTableId === baseTableRef) return 4;
+  return 0;
+}
+
+function validateIndexChunks(codebookId: string, chunks: IndexedChunk[]): IndexedChunk[] {
+  const seen = new Set<string>();
+  const deduped: IndexedChunk[] = [];
+  const missing: string[] = [];
+  for (const chunk of chunks) {
+    const sourcePath = String(chunk.sourcePath || "").trim();
+    if (!sourcePath) {
+      throw new Error(`GHOST_SOURCE_VIOLATION: empty sourcePath in ${codebookId} index`);
+    }
+    const resolved = path.isAbsolute(sourcePath)
+      ? sourcePath
+      : path.resolve(process.cwd(), sourcePath);
+    if (!fs.existsSync(resolved)) {
+      missing.push(sourcePath);
+      continue;
+    }
+    const key = `${sourcePath}:${chunk.startLine}-${chunk.endLine}`;
+    if (seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    deduped.push(chunk);
+  }
+  if (missing.length > 0) {
+    const sample = missing.slice(0, 5).join(", ");
+    throw new Error(
+      `GHOST_SOURCE_VIOLATION: ${missing.length} missing source files in ${codebookId} index (e.g. ${sample})`
+    );
+  }
+  return deduped;
+}
 
 /**
  * Resolve a user-provided codebookId to the canonical internal ID.
@@ -86,9 +154,10 @@ export function loadCodebookIndex(codebookId: string): IndexedChunk[] {
 
   const raw = fs.readFileSync(indexPath, "utf8");
   const parsed = JSON.parse(raw) as IndexedChunk[];
+  const validated = validateIndexChunks(canonicalId, parsed);
 
-  indexCache[canonicalId] = parsed;
-  return parsed;
+  indexCache[canonicalId] = validated;
+  return validated;
 }
 
 /**
@@ -169,7 +238,7 @@ export async function searchCodebook(
   // 3. Compute similarities
   const scored = chunks.map((chunk) => ({
     chunk,
-    score: cosineSimilarity(queryEmbedding, chunk.embedding),
+    score: cosineSimilarity(queryEmbedding, chunk.embedding) + chunkStructuralBoost(chunk, trimmed),
   }));
 
   // 4. Sort by similarity descending

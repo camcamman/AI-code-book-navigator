@@ -13,6 +13,13 @@ type SourceRef = {
   publicUrl?: string;
   startLine: number;
   endLine: number;
+  isTable?: boolean;
+  tableLabel?: string;
+  tablePage?: number;
+  tablePdfPath?: string;
+  tableImagePath?: string;
+  tablePdfUrl?: string;
+  tableImageUrl?: string;
 };
 
 type AmendmentRef = {
@@ -71,6 +78,55 @@ export default function HomePage() {
     }
   }, []);
 
+  function queryLooksLikeExplicitTable(queryText: string): boolean {
+    return /\btable\s+[a-z]?\d+(?:\.\d+)*(?:\([0-9a-z]+\))?/i.test(queryText);
+  }
+
+  function extractCitedSourceIds(answerText: string): Set<number> {
+    const out = new Set<number>();
+    const pattern = /\[source\s+(\d+),\s+lines\s+\d+[-–]\d+\]/gi;
+    let match: RegExpExecArray | null = null;
+    while ((match = pattern.exec(answerText)) !== null) {
+      const id = Number(match[1]);
+      if (Number.isFinite(id)) out.add(id);
+    }
+    return out;
+  }
+
+  function filterSourcesByAnswer(
+    sourcesList: SourceRef[],
+    answerText: string | null,
+    queryText?: string
+  ): SourceRef[] {
+    const explicitTableQuery = queryLooksLikeExplicitTable(queryText || "");
+    const tableSource =
+      sourcesList.find((s) => s.isTable && (s.tablePdfUrl || s.tableImageUrl)) ||
+      null;
+
+    if (!answerText) {
+      return tableSource ? [tableSource] : [];
+    }
+    const cited = extractCitedSourceIds(answerText);
+    if (cited.size === 0) {
+      return explicitTableQuery && tableSource ? [tableSource] : [];
+    }
+    const seenPath = new Set<string>();
+    const out: SourceRef[] = [];
+
+    if (explicitTableQuery && tableSource) {
+      seenPath.add(tableSource.sourcePath);
+      out.push(tableSource);
+    }
+
+    for (const s of sourcesList) {
+      if (!cited.has(s.sourceId)) continue;
+      if (seenPath.has(s.sourcePath)) continue;
+      seenPath.add(s.sourcePath);
+      out.push(s);
+    }
+    return out;
+  }
+
 
     async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
@@ -115,18 +171,25 @@ export default function HomePage() {
       const data: AskResponse = await res.json();
 
       if (!data.ok) {
+        const tableOnly = (data.sources || []).some(
+          (s) => s.isTable && (s.tablePdfUrl || s.tableImageUrl)
+        );
         setAnswer(null);
-        setSources([]);
+        setSources(data.sources || []);
         setAmendments(data.amendments || []);
         setError(
-          data.reason ||
-            "The assistant could not answer from the provided code sections."
+          tableOnly
+            ? null
+            : data.reason ||
+                "The assistant could not answer from the provided code sections."
         );
         return;
       }
 
       setAnswer(data.answer || null);
-      setSources(data.sources || []);
+      setSources(
+        filterSourcesByAnswer(data.sources || [], data.answer || null, trimmed)
+      );
       setAmendments(data.amendments || []);
     } catch (err: any) {
       console.error("Error calling /api/ask:", err);
@@ -138,6 +201,13 @@ export default function HomePage() {
       setLoading(false);
     }
   }
+
+  const primaryTableSource =
+    sources.find((s) => s.isTable && (s.tablePdfUrl || s.tableImageUrl)) || null;
+  const hasPrimaryTableAnswer = Boolean(primaryTableSource);
+  const secondarySources = primaryTableSource
+    ? sources.filter((s) => s !== primaryTableSource)
+    : sources;
 
   return (
     <main
@@ -255,6 +325,94 @@ export default function HomePage() {
         </div>
       )}
 
+      {hasPrimaryTableAnswer && primaryTableSource && (
+        <section style={{ marginBottom: "1.5rem" }}>
+          <h2
+            style={{
+              fontSize: "1.25rem",
+              fontWeight: 600,
+              marginBottom: "0.5rem",
+            }}
+          >
+            Answer
+          </h2>
+          <div
+            style={{
+              borderRadius: "8px",
+              border: "1px solid #dbe4f0",
+              backgroundColor: "#f8fbff",
+              padding: "0.75rem",
+            }}
+          >
+            <div
+              style={{
+                display: "flex",
+                justifyContent: "space-between",
+                alignItems: "center",
+                gap: "0.75rem",
+                marginBottom: primaryTableSource.tablePdfUrl || primaryTableSource.tableImageUrl ? "0.75rem" : 0,
+                flexWrap: "wrap",
+              }}
+            >
+              <div style={{ fontSize: "0.95rem", fontWeight: 600 }}>
+                {primaryTableSource.tableLabel || primaryTableSource.sectionLabel || "Matched table"}
+                {primaryTableSource.tablePage ? `, PDF page ${primaryTableSource.tablePage}` : ""}
+              </div>
+              {primaryTableSource.tablePdfUrl && (
+                <a
+                  href={primaryTableSource.tablePdfUrl}
+                  target="_blank"
+                  rel="noreferrer"
+                  style={{
+                    fontSize: "0.85rem",
+                    color: "#2563eb",
+                    textDecoration: "none",
+                    fontWeight: 500,
+                  }}
+                >
+                  Open table PDF
+                </a>
+              )}
+            </div>
+            {primaryTableSource.tablePdfUrl ? (
+              <iframe
+                src={primaryTableSource.tablePdfUrl}
+                title={primaryTableSource.tableLabel || primaryTableSource.sectionLabel || "Table PDF"}
+                style={{
+                  display: "block",
+                  width: "100%",
+                  height: "720px",
+                  borderRadius: "6px",
+                  border: "1px solid #cbd5e1",
+                  backgroundColor: "#fff",
+                }}
+              />
+            ) : primaryTableSource.tableImageUrl ? (
+              <a href={primaryTableSource.tableImageUrl} target="_blank" rel="noreferrer">
+                <img
+                  src={primaryTableSource.tableImageUrl}
+                  alt={primaryTableSource.tableLabel || primaryTableSource.sectionLabel || "Table preview"}
+                  loading="lazy"
+                  style={{
+                    display: "block",
+                    width: "100%",
+                    maxHeight: "720px",
+                    objectFit: "contain",
+                    borderRadius: "6px",
+                    border: "1px solid #cbd5e1",
+                    backgroundColor: "#fff",
+                  }}
+                />
+              </a>
+            ) : (
+              <div style={{ fontSize: "0.85rem", color: "#555" }}>
+                No preview asset is available for this table yet.
+              </div>
+            )}
+          </div>
+        </section>
+      )}
+
       {answer && (
         <>
           <section style={{ marginBottom: "1.5rem" }}>
@@ -265,7 +423,7 @@ export default function HomePage() {
                 marginBottom: "0.5rem",
               }}
             >
-              Answer
+              {hasPrimaryTableAnswer ? "Text Answer" : "Answer"}
             </h2>
             <div
               style={{
@@ -298,20 +456,36 @@ export default function HomePage() {
               </div>
             ) : (
               <ul style={{ paddingLeft: "1.2rem" }}>
-                {amendments.map((a) => (
+                {amendments.map((a) => {
+                  const label = a.sectionLabel || a.sourcePath;
+                  const link =
+                    a.publicUrl ||
+                    (a.sourcePath?.startsWith("http") ? a.sourcePath : undefined);
+                  return (
                   <li key={`${a.id}-${a.sourceId}`} style={{ marginBottom: "1rem" }}>
                     <div>
                       <strong>
-                        {a.citation} {a.sectionLabel || a.sourcePath}
+                        {a.citation}{" "}
+                        {link ? (
+                          <a href={link} target="_blank" rel="noreferrer">
+                            {label}
+                          </a>
+                        ) : (
+                          label
+                        )}
                       </strong>
                     </div>
-                    {a.publicUrl && (
-                      <div style={{ fontSize: "0.85rem", marginTop: "0.15rem" }}>
+                    <div style={{ fontSize: "0.85rem", marginTop: "0.15rem" }}>
+                      {a.publicUrl ? (
                         <a href={a.publicUrl} target="_blank" rel="noreferrer">
-                          View official text
+                          Click here to view the official source
                         </a>
-                      </div>
-                    )}
+                      ) : (
+                        <span style={{ color: "#666" }}>
+                          Click here to view the official source
+                        </span>
+                      )}
+                    </div>
                     <pre
                       style={{
                         whiteSpace: "pre-wrap",
@@ -327,14 +501,15 @@ export default function HomePage() {
                       {a.fullText}
                     </pre>
                   </li>
-                ))}
+                  );
+                })}
               </ul>
             )}
           </section>
         </>
       )}
 
-      {sources.length > 0 && (
+      {secondarySources.length > 0 && (
         <section>
           <h3
             style={{
@@ -346,28 +521,130 @@ export default function HomePage() {
             Sources used
           </h3>
           <ul style={{ paddingLeft: "1.2rem" }}>
-            {sources.map((s) => (
+            {secondarySources.map((s) => {
+              const labelLink =
+                s.publicUrl ||
+                (s.sourcePath?.startsWith("http") ? s.sourcePath : undefined);
+              const displayLabel = s.tableLabel || s.sectionLabel;
+              return (
               <li key={s.sourceId} style={{ marginBottom: "0.6rem" }}>
                 <div>
                   <strong>
                     [source {s.sourceId}] {s.codebookLabel}
                   </strong>
                 </div>
-                {s.sectionLabel && (
-                  <div style={{ fontSize: "0.9rem" }}>{s.sectionLabel}</div>
+                {displayLabel && (
+                  <div style={{ fontSize: "0.9rem" }}>
+                    {labelLink ? (
+                      <a href={labelLink} target="_blank" rel="noreferrer">
+                        {displayLabel}
+                      </a>
+                    ) : (
+                      displayLabel
+                    )}
+                  </div>
                 )}
                 <div style={{ fontSize: "0.85rem", color: "#555" }}>
-                  {s.sourcePath}, lines {s.startLine}-{s.endLine}
-                </div>
-                {s.publicUrl && (
-                  <div style={{ fontSize: "0.85rem", marginTop: "0.15rem" }}>
-                    <a href={s.publicUrl} target="_blank" rel="noreferrer">
-                      View official text
+                  {labelLink && s.sourcePath?.startsWith("http") ? (
+                    <a href={s.sourcePath} target="_blank" rel="noreferrer">
+                      {s.sourcePath}
                     </a>
+                  ) : (
+                    s.sourcePath
+                  )}
+                  , lines {s.startLine}-{s.endLine}
+                </div>
+                <div style={{ fontSize: "0.85rem", marginTop: "0.15rem" }}>
+                  {s.publicUrl ? (
+                    <a href={s.publicUrl} target="_blank" rel="noreferrer">
+                      Click here to view the official source
+                    </a>
+                  ) : (
+                    <span style={{ color: "#666" }}>
+                      Click here to view the official source
+                    </span>
+                  )}
+                </div>
+                {s.isTable && (
+                  <div
+                    style={{
+                      marginTop: "0.75rem",
+                      padding: "0.75rem",
+                      border: "1px solid #dbe4f0",
+                      borderRadius: "8px",
+                      backgroundColor: "#f8fbff",
+                    }}
+                  >
+                    <div
+                      style={{
+                        display: "flex",
+                        justifyContent: "space-between",
+                        alignItems: "center",
+                        gap: "0.75rem",
+                        marginBottom: s.tablePdfUrl || s.tableImageUrl ? "0.75rem" : 0,
+                        flexWrap: "wrap",
+                      }}
+                    >
+                      <div style={{ fontSize: "0.9rem", fontWeight: 600 }}>
+                        {s.tableLabel || "Table preview"}
+                        {s.tablePage ? `, PDF page ${s.tablePage}` : ""}
+                      </div>
+                      {s.tablePdfUrl && (
+                        <a
+                          href={s.tablePdfUrl}
+                          target="_blank"
+                          rel="noreferrer"
+                          style={{
+                            fontSize: "0.85rem",
+                            color: "#2563eb",
+                            textDecoration: "none",
+                            fontWeight: 500,
+                          }}
+                        >
+                          Open table PDF
+                        </a>
+                      )}
+                    </div>
+                    {s.tablePdfUrl ? (
+                      <iframe
+                        src={s.tablePdfUrl}
+                        title={s.tableLabel || s.sectionLabel || "Table PDF"}
+                        style={{
+                          display: "block",
+                          width: "100%",
+                          height: "560px",
+                          borderRadius: "6px",
+                          border: "1px solid #cbd5e1",
+                          backgroundColor: "#fff",
+                        }}
+                      />
+                    ) : s.tableImageUrl ? (
+                      <a href={s.tableImageUrl} target="_blank" rel="noreferrer">
+                        <img
+                          src={s.tableImageUrl}
+                          alt={s.tableLabel || s.sectionLabel || "Table preview"}
+                          loading="lazy"
+                          style={{
+                            display: "block",
+                            width: "100%",
+                            maxHeight: "520px",
+                            objectFit: "contain",
+                            borderRadius: "6px",
+                            border: "1px solid #cbd5e1",
+                            backgroundColor: "#fff",
+                          }}
+                        />
+                      </a>
+                    ) : (
+                      <div style={{ fontSize: "0.85rem", color: "#555" }}>
+                        No preview asset is available for this table yet.
+                      </div>
+                    )}
                   </div>
                 )}
               </li>
-            ))}
+              );
+            })}
           </ul>
         </section>
       )}

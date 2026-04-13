@@ -5,6 +5,7 @@ export type CodebookDef = {
   label: string;
   isAmendment?: boolean;
   baseCodebookId?: string; // if this is an amendment for a base codebook
+  tableManifestPath?: string;
 };
 
 /**
@@ -19,6 +20,7 @@ export const CODEBOOKS: CodebookDef[] = [
     id: "irc-utah-2021",
     label: "IRC Utah Code 2021",
     isAmendment: false,
+    tableManifestPath: "tables/2024_irc_2nd_printing_tables.json",
   },
   {
     id: "irc-utah-2021-amendments",
