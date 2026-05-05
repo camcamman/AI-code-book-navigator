@@ -17,6 +17,7 @@ export type AmendmentAction = "delete" | "replace" | "add" | "modify" | "unknown
 export type AmendmentInfo = {
   action: AmendmentAction;
   targetSectionId: string | null;
+  excludesWholeSection: boolean;
 };
 
 /**
@@ -91,6 +92,32 @@ export function classifyAmendmentAction(text: string): AmendmentAction {
   return "unknown";
 }
 
+function isWholeSectionExclusion(text: string, action: AmendmentAction): boolean {
+  const lower = String(text || "").toLowerCase();
+
+  if (action !== "replace" && action !== "delete") {
+    return false;
+  }
+
+  const partialMarkers = [
+    /\bunder\s+[a-z][a-z0-9 /&(),.'"-]*,\s+the following changes are made\b/i,
+    /\bnumber\s+\d+\s+is\s+(?:deleted|replaced|deleted and replaced)\b/i,
+    /\bnumber\s+\d+\b/i,
+    /\bthe words\s+"[^"]+"\s+are\b/i,
+    /\bexception\s+\d+\b/i,
+    /\bthe last sentence is deleted\b/i,
+    /\bthe following sentence is added\b/i,
+    /\bthe following changes are made\b/i,
+    /\bthe definition for\b/i,
+  ];
+
+  if (partialMarkers.some((pattern) => pattern.test(lower))) {
+    return false;
+  }
+
+  return true;
+}
+
 export function getAmendmentInfo(chunk: IndexedChunk): AmendmentInfo {
   const meta = (chunk as any).meta ?? {};
   const metaTarget = meta.targetSectionId ?? meta.sectionId ?? null;
@@ -108,10 +135,18 @@ export function getAmendmentInfo(chunk: IndexedChunk): AmendmentInfo {
   }
 
   if (meta && typeof meta === "object") {
-    meta.amendment = { action, targetSectionId };
+    meta.amendment = {
+      action,
+      targetSectionId,
+      excludesWholeSection: isWholeSectionExclusion(chunk.content || "", action),
+    };
   }
 
-  return { action, targetSectionId };
+  return {
+    action,
+    targetSectionId,
+    excludesWholeSection: isWholeSectionExclusion(chunk.content || "", action),
+  };
 }
 
 export function collectAmendmentExclusions(chunks: IndexedChunk[]): {
@@ -123,7 +158,10 @@ export function collectAmendmentExclusions(chunks: IndexedChunk[]): {
 
   for (const chunk of chunks) {
     const info = getAmendmentInfo(chunk);
-    if (info.action === "delete" || info.action === "replace") {
+    if (
+      (info.action === "delete" || info.action === "replace") &&
+      info.excludesWholeSection
+    ) {
       if (!info.targetSectionId) {
         failClosedNoBase = true;
       } else {
@@ -169,7 +207,7 @@ export function extractStructureFromQuery(
 
   // Section / Sec. / § N-N-N.N etc.
   const sectionMatch = lower.match(
-    /\b(?:section|sec\.?|§)\s+([0-9]+(?:-[0-9a-z]+)*(?:\.[0-9a-z]+)*)/i
+    /\b(?:section|sec\.?|§)\s+([a-z]?[0-9]+(?:-[0-9a-z]+)*(?:\.[0-9a-z]+)*)/i
   );
   if (sectionMatch && sectionMatch[1]) {
     result.section = sectionMatch[1];

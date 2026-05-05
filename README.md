@@ -54,7 +54,7 @@ Optional model env vars:
 
 ```bash
 OPENAI_EMBEDDING_MODEL=text-embedding-3-small
-OPENAI_TABLE_MODEL=gpt-4o-mini
+OPENAI_TABLE_MODEL=gpt-5.5
 ```
 
 ## Quick Start
@@ -119,7 +119,7 @@ Important:
 
 ### 3. Download And Extract IRC Utah Amendments
 
-Download and split the Utah amendments PDF into individual amendment text files:
+Download the Utah Legislature's structured XML for Part 2 sections `15A-3-202` through `15A-3-206`, cache the source files locally, and split the top-level amendment items into individual text files:
 
 ```bash
 npx -y tsx scripts/downloadUtahIrcAmendments.ts
@@ -127,10 +127,25 @@ npx -y tsx scripts/downloadUtahIrcAmendments.ts
 
 This writes files under:
 
+- `codebooks/irc-utah-2021-amendments/raw/source/`
 - `codebooks/irc-utah-2021-amendments/raw/items/`
 - `codebooks/irc-utah-2021-amendments/_download_extract_report.json`
 
-If you already have a local amendment source file and want to re-extract from disk instead of downloading:
+By default this pulls Utah Code Part 2 sections:
+
+- `15A-3-202`
+- `15A-3-203`
+- `15A-3-204`
+- `15A-3-205`
+- `15A-3-206`
+
+You can limit the fetch to specific sections:
+
+```bash
+npx -y tsx scripts/downloadUtahIrcAmendments.ts --sections 202,203
+```
+
+If you want the older local-source re-extract path instead of the live XML downloader:
 
 ```bash
 npx -y tsx scripts/extractIrcAmendments.ts

@@ -56,6 +56,11 @@ type ItemResult = {
   reasons: string[];
 };
 
+const ITEM_START_RE =
+  /^\s*\(?(\d+)\)?[.)]?\s*(?:In\s+)?IRC,\s+(?:Section|Sections|Table|Tables|Chapter|Chapters)\b/i;
+const TARGET_REF_RE =
+  /\b(?:Section|Sections|Table|Tables|Chapter|Chapters)\s+([A-Za-z]?\d+(?:\.\d+)*(?:\([^)]+\))?[A-Za-z]?)/i;
+
 function parseArgs(argv: string[]): Args {
   const out: Args = {
     minItems: 20,
@@ -139,7 +144,7 @@ function stripPdfHeadersFooters(text: string): string {
 }
 
 function normalizeSectionId(raw: string): string {
-  let cleaned = raw.trim().replace(/[.,;:)\]]+$/, "");
+  let cleaned = raw.trim().replace(/[.,;:\]]+$/, "");
   if (!cleaned) return cleaned;
   if (/^[0-9]/.test(cleaned)) {
     cleaned = `R${cleaned}`;
@@ -222,12 +227,7 @@ function readSourceText(filePath: string): string {
 }
 
 function isItemStart(line: string): boolean {
-  return (
-    /^\s*\(\d+\)\s*In\s+IRC,\s+Section/i.test(line) ||
-    /^\s*\d+\)\s*In\s+IRC,\s+Section/i.test(line) ||
-    /^\s*\d+\.\s*In\s+IRC,\s+Section/i.test(line) ||
-    /^\s*In\s+IRC,\s+Section/i.test(line)
-  );
+  return ITEM_START_RE.test(line);
 }
 
 function splitIntoItems(text: string): Item[] {
@@ -277,9 +277,7 @@ function splitIntoItems(text: string): Item[] {
 }
 
 function parseItemNumber(startLine: string, fallback: number): { value: number; fromSource: number | null } {
-  const match = startLine.match(
-    /^\s*\(?(\d+)\)?[.)]?\s*In\s+IRC,\s+Section/i
-  );
+  const match = startLine.match(ITEM_START_RE);
   if (match && match[1]) {
     return { value: Number(match[1]), fromSource: Number(match[1]) };
   }
@@ -287,7 +285,7 @@ function parseItemNumber(startLine: string, fallback: number): { value: number; 
 }
 
 function parseSectionId(text: string): string | null {
-  const match = text.match(/Section\s+([A-Za-z]?\d+(?:\.\d+)*[A-Za-z]?)/i);
+  const match = text.match(TARGET_REF_RE);
   if (!match || !match[1]) return null;
   const normalized = normalizeSectionId(match[1]);
   return normalized || null;
@@ -335,7 +333,7 @@ function validateItem(
   if (text.length <= 120) {
     reasons.push("text_too_short");
   }
-  if (!/In\s+IRC,\s+Section/i.test(text)) {
+  if (!/(?:In\s+)?IRC,\s+(?:Section|Sections|Table|Tables|Chapter|Chapters)/i.test(text)) {
     reasons.push("missing_in_irc_section_phrase");
   }
   if (!sectionId) {

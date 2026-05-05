@@ -41,6 +41,8 @@ type AskResponse = {
   query: string;
   codebookId: string;
   answer: string | null;
+  aiSummary?: string | null;
+  aiSummaryDisclaimer?: string | null;
   sources: SourceRef[];
   amendments: AmendmentRef[];
   reason?: string;
@@ -52,6 +54,8 @@ export default function HomePage() {
   const [codebookId, setCodebookId] = useState("irc-utah-2021");
   const [includeAmendments, setIncludeAmendments] = useState(true);
   const [answer, setAnswer] = useState<string | null>(null);
+  const [aiSummary, setAiSummary] = useState<string | null>(null);
+  const [aiSummaryDisclaimer, setAiSummaryDisclaimer] = useState<string | null>(null);
   const [sources, setSources] = useState<SourceRef[]>([]);
   const [amendments, setAmendments] = useState<AmendmentRef[]>([]);
   const [loading, setLoading] = useState(false);
@@ -108,7 +112,8 @@ export default function HomePage() {
     }
     const cited = extractCitedSourceIds(answerText);
     if (cited.size === 0) {
-      return explicitTableQuery && tableSource ? [tableSource] : [];
+      if (explicitTableQuery && tableSource) return [tableSource];
+      return sourcesList;
     }
     const seenPath = new Set<string>();
     const out: SourceRef[] = [];
@@ -145,6 +150,8 @@ export default function HomePage() {
     setLoading(true);
     setError(null);
     setAnswer(null);
+    setAiSummary(null);
+    setAiSummaryDisclaimer(null);
     setSources([]);
     setAmendments([]);
 
@@ -175,6 +182,8 @@ export default function HomePage() {
           (s) => s.isTable && (s.tablePdfUrl || s.tableImageUrl)
         );
         setAnswer(null);
+        setAiSummary(null);
+        setAiSummaryDisclaimer(null);
         setSources(data.sources || []);
         setAmendments(data.amendments || []);
         setError(
@@ -187,6 +196,8 @@ export default function HomePage() {
       }
 
       setAnswer(data.answer || null);
+      setAiSummary(data.aiSummary || null);
+      setAiSummaryDisclaimer(data.aiSummaryDisclaimer || null);
       setSources(
         filterSourcesByAnswer(data.sources || [], data.answer || null, trimmed)
       );
@@ -415,6 +426,44 @@ export default function HomePage() {
 
       {answer && (
         <>
+          {aiSummary && (
+            <section style={{ marginBottom: "1.5rem" }}>
+              <h2
+                style={{
+                  fontSize: "1.25rem",
+                  fontWeight: 600,
+                  marginBottom: "0.5rem",
+                }}
+              >
+                AI Summary
+              </h2>
+              <div
+                style={{
+                  whiteSpace: "pre-wrap",
+                  lineHeight: 1.5,
+                  fontSize: "0.95rem",
+                  borderRadius: "4px",
+                  border: "1px solid #f5c27a",
+                  padding: "0.75rem",
+                  backgroundColor: "#fff8eb",
+                }}
+              >
+                <div
+                  style={{
+                    fontSize: "0.82rem",
+                    fontWeight: 600,
+                    color: "#92400e",
+                    marginBottom: "0.5rem",
+                  }}
+                >
+                  {aiSummaryDisclaimer ||
+                    "AI-generated plain-language summary. It is not the official code text and may be incomplete or inaccurate."}
+                </div>
+                {aiSummary}
+              </div>
+            </section>
+          )}
+
           <section style={{ marginBottom: "1.5rem" }}>
             <h2
               style={{

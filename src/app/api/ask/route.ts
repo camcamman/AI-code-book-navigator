@@ -15,6 +15,7 @@ import {
   collectAmendmentExclusions,
   extractStructureFromQuery,
   findAmendmentChunksByStructure,
+  getAmendmentInfo,
   normalizeIrcSectionId,
 } from "../../../lib/amendmentLinking";
 export const runtime = "nodejs";
@@ -24,7 +25,10 @@ const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
 });
 
-const CHAT_MODEL = "gpt-5.2";
+const CHAT_MODEL = process.env.OPENAI_CHAT_MODEL || process.env.OPENAI_MODEL || "gpt-5.5";
+const FALLBACK_CHAT_MODEL = process.env.OPENAI_FALLBACK_CHAT_MODEL || "gpt-5.4";
+const SUMMARY_DISCLAIMER =
+  "AI-generated plain-language summary. It is not the official code text and may be incomplete or inaccurate.";
 
 type AskRequestBody = {
   query: string;
@@ -73,6 +77,8 @@ type AskResponse = {
   query: string;
   codebookId: string;
   answer: string | null;
+  aiSummary?: string | null;
+  aiSummaryDisclaimer?: string | null;
   sources: SourceRef[];
   amendments: AmendmentRef[];
   reason?: string;
@@ -93,15 +99,77 @@ type MemoryEntry = {
 const sessionMemory = new Map<string, MemoryEntry[]>();
 
 type SelectedQuote = { sourceId: number; excerpt: string };
+type ExpandedQuote = SelectedQuote & { startLine?: number; endLine?: number };
 
 type SelectorResult = {
   sections: Array<{
     title: string;
-    items: SelectedQuote[];
+    items: ExpandedQuote[];
   }>;
 };
 
 let lastSelectorValidationFailReason: string | null = null;
+
+type ChatCompletionParams = Parameters<typeof openai.chat.completions.create>[0];
+
+function shouldFallbackChatModel(error: unknown): boolean {
+  const status = (error as any)?.status;
+  const message = String((error as any)?.message || (error as any)?.error?.message || "");
+  return (
+    status === 400 ||
+    status === 404 ||
+    /model|does not exist|not found|not have access|unsupported/i.test(message)
+  );
+}
+
+function shouldRetryWithoutTemperature(error: unknown): boolean {
+  const param = String((error as any)?.param || (error as any)?.error?.param || "");
+  const code = String((error as any)?.code || (error as any)?.error?.code || "");
+  const message = String((error as any)?.message || (error as any)?.error?.message || "");
+  return (
+    param === "temperature" ||
+    code === "unsupported_value" && /temperature/i.test(message)
+  );
+}
+
+async function createChatCompletion(params: ChatCompletionParams): Promise<any> {
+  const requestParams =
+    String(params.model || "").startsWith("gpt-5.5") && "temperature" in params
+      ? (({ temperature: _temperature, ...rest }) => rest)(params as any)
+      : params;
+
+  try {
+    console.log("[/api/ask] chat model request", { model: requestParams.model });
+    return await openai.chat.completions.create(requestParams);
+  } catch (error) {
+    if ("temperature" in requestParams && shouldRetryWithoutTemperature(error)) {
+      const { temperature: _temperature, ...withoutTemperature } = requestParams as any;
+      console.warn("[/api/ask] chat model rejected temperature; retrying with default temperature", {
+        model: requestParams.model,
+      });
+      console.log("[/api/ask] chat model request", { model: withoutTemperature.model });
+      return openai.chat.completions.create(withoutTemperature);
+    }
+
+    if (
+      FALLBACK_CHAT_MODEL &&
+      requestParams.model !== FALLBACK_CHAT_MODEL &&
+      shouldFallbackChatModel(error)
+    ) {
+      console.warn("[/api/ask] chat model failed; retrying with fallback", {
+        model: requestParams.model,
+        fallback: FALLBACK_CHAT_MODEL,
+        error,
+      });
+      console.log("[/api/ask] chat model request", { model: FALLBACK_CHAT_MODEL });
+      return openai.chat.completions.create({
+        ...requestParams,
+        model: FALLBACK_CHAT_MODEL,
+      });
+    }
+    throw error;
+  }
+}
 
 function sentenceHasQuoteAndCitation(s: string): boolean {
   const hasQuote = /"[^"]{3,}"/.test(s);
@@ -123,6 +191,50 @@ function validateFinalAnswerOrFail(answer: string): boolean {
   return quoteCitationPairs.length >= citations.length;
 }
 
+async function generateAiSummary(
+  query: string,
+  answer: string
+): Promise<string | null> {
+  const trimmed = answer.trim();
+  if (!trimmed) return null;
+  if (trimmed === "I cannot answer that from the provided code sections.") {
+    return null;
+  }
+
+  const system = `
+You summarize building-code answers into plain language.
+
+Rules:
+1) Summarize only what is already stated in the provided answer.
+2) Do not add legal interpretation, advice, or "official" wording.
+3) Do not invent missing requirements, exceptions, or thresholds.
+4) Keep it short: 2 to 5 sentences.
+5) Use cautious wording such as "The answer appears to say" or "It appears that".
+6) Do not mention sources or citations.
+7) Do not quote large blocks of text.
+8) If the answer is a numbered list, preserve the main list structure in a compact way.
+  `.trim();
+
+  const user = `Question:\n${query}\n\nExact answer to summarize:\n${trimmed}`;
+
+  try {
+    const res = await createChatCompletion({
+      model: CHAT_MODEL,
+      messages: [
+        { role: "system", content: system },
+        { role: "user", content: user },
+      ],
+      temperature: 0.2,
+    });
+
+    const summary = res.choices[0]?.message?.content?.trim() || "";
+    return summary || null;
+  } catch (error) {
+    console.warn("[/api/ask] AI summary generation failed", error);
+    return null;
+  }
+}
+
 
 function isNonEmptyString(x: unknown): x is string {
   return typeof x === "string" && x.trim().length > 0;
@@ -132,11 +244,1284 @@ function normalizeWhitespace(text: string): string {
   return text.replace(/\s+/g, " ").trim();
 }
 
+function isMetadataLine(line: string): boolean {
+  return /^(?:PDF_PAGE|SECTION_ID|SECTION|TITLE|CAPTION|TABLE_ID|SOURCE_URL|EFFECTIVE_DATE|UTAH_CATCHLINE):/.test(
+    line.trim()
+  );
+}
+
+function isSubheadingLine(line: string): boolean {
+  const t = normalizeWhitespace(line);
+  if (!t) return false;
+  return /^[A-Z][A-Za-z0-9 /&(),.'"-]{1,80}:$/.test(t);
+}
+
+function isOrderedListLine(line: string): boolean {
+  const t = line.trim();
+  return /^(?:\d+\.|[a-z]\.|[A-Z]\.)\s+/.test(t);
+}
+
+function readSourceLines(sourcePath: string): Array<{ lineNumber: number; text: string }> | null {
+  const resolved = path.resolve(process.cwd(), sourcePath);
+  if (!fs.existsSync(resolved)) return null;
+
+  try {
+    return fs
+      .readFileSync(resolved, "utf8")
+      .split(/\r?\n/)
+      .map((text, idx) => ({ lineNumber: idx + 1, text: text.replace(/\s+$/g, "") }));
+  } catch {
+    return null;
+  }
+}
+
+function findBodyStartIndex(lines: Array<{ lineNumber: number; text: string }>): number {
+  for (let i = 0; i < lines.length; i++) {
+    const t = normalizeWhitespace(lines[i].text);
+    if (!t) continue;
+    if (isMetadataLine(t)) continue;
+    return i;
+  }
+  return 0;
+}
+
+function extractBlockText(
+  lines: Array<{ lineNumber: number; text: string }>,
+  startIdx: number,
+  endIdx: number
+): { excerpt: string; startLine: number; endLine: number } | null {
+  const slice = lines.slice(startIdx, endIdx + 1);
+  const excerpt = slice.map((line) => line.text).join("\n").trim();
+  if (!excerpt) return null;
+  return {
+    excerpt,
+    startLine: slice[0].lineNumber,
+    endLine: slice[slice.length - 1].lineNumber,
+  };
+}
+
+function getWholeSourceBodyExcerpt(
+  source: SourceRef
+): { excerpt: string; startLine: number; endLine: number } | null {
+  const lines = readSourceLines(source.sourcePath);
+  if (!lines || lines.length === 0) return null;
+  const bodyStart = findBodyStartIndex(lines);
+  return extractBlockText(lines, bodyStart, lines.length - 1);
+}
+
+type ParsedListBlock = {
+  heading: string;
+  startLine: number;
+  endLine: number;
+  items: Array<{ number: number; text: string; startLine: number; endLine: number }>;
+};
+
+type ParsedListSection = {
+  intro: string;
+  introStartLine: number;
+  introEndLine: number;
+  blocks: ParsedListBlock[];
+};
+
+type ParsedAmendmentEdits = {
+  scopeHeading: string | null;
+  replaceItems: Map<number, string>;
+  deleteItems: Set<number>;
+  addItems: Array<{ number: number; text: string }>;
+};
+
+function parseNumberedListSection(source: SourceRef): ParsedListSection | null {
+  const lines = readSourceLines(source.sourcePath);
+  if (!lines || lines.length === 0) return null;
+
+  const bodyStart = findBodyStartIndex(lines);
+  const bodyLines = lines.slice(bodyStart);
+  if (bodyLines.length === 0) return null;
+
+  let firstHeadingIdx = -1;
+  for (let i = 0; i < bodyLines.length; i++) {
+    if (isSubheadingLine(bodyLines[i].text) && bodyLines[i + 1] && isOrderedListLine(bodyLines[i + 1].text)) {
+      firstHeadingIdx = i;
+      break;
+    }
+  }
+  if (firstHeadingIdx === -1) return null;
+
+  const introLines = bodyLines.slice(0, firstHeadingIdx);
+  const intro = introLines.map((line) => line.text).join("\n").trim();
+  const introStartLine = introLines[0]?.lineNumber ?? bodyLines[0].lineNumber;
+  const introEndLine = introLines[introLines.length - 1]?.lineNumber ?? introStartLine;
+
+  const blocks: ParsedListBlock[] = [];
+  let i = firstHeadingIdx;
+  while (i < bodyLines.length) {
+    const line = bodyLines[i];
+    if (!(isSubheadingLine(line.text) && bodyLines[i + 1] && isOrderedListLine(bodyLines[i + 1].text))) {
+      i += 1;
+      continue;
+    }
+
+    const heading = normalizeWhitespace(line.text).replace(/:$/, "");
+    const blockStartLine = line.lineNumber;
+    const items: ParsedListBlock["items"] = [];
+    i += 1;
+
+    while (i < bodyLines.length) {
+      const current = bodyLines[i];
+      if (isSubheadingLine(current.text) && bodyLines[i + 1] && isOrderedListLine(bodyLines[i + 1].text)) {
+        break;
+      }
+
+      const itemMatch = current.text.trim().match(/^(\d+)\.\s*(.*)$/);
+      if (!itemMatch) {
+        i += 1;
+        continue;
+      }
+
+      const itemNumber = Number(itemMatch[1]);
+      const itemLines = [itemMatch[2]];
+      const itemStartLine = current.lineNumber;
+      let itemEndLine = current.lineNumber;
+      i += 1;
+
+      while (i < bodyLines.length) {
+        const next = bodyLines[i];
+        if (next.text.trim().match(/^\d+\.\s+/)) break;
+        if (isSubheadingLine(next.text) && bodyLines[i + 1] && isOrderedListLine(bodyLines[i + 1].text)) {
+          break;
+        }
+        itemLines.push(next.text);
+        itemEndLine = next.lineNumber;
+        i += 1;
+      }
+
+      items.push({
+        number: itemNumber,
+        text: normalizeWhitespace(itemLines.join(" ")),
+        startLine: itemStartLine,
+        endLine: itemEndLine,
+      });
+    }
+
+    blocks.push({
+      heading,
+      startLine: blockStartLine,
+      endLine: items[items.length - 1]?.endLine ?? blockStartLine,
+      items,
+    });
+  }
+
+  return blocks.length > 0
+    ? { intro, introStartLine, introEndLine, blocks }
+    : null;
+}
+
+function parseAmendmentEdits(source: SourceRef): ParsedAmendmentEdits {
+  const body = getWholeSourceBodyExcerpt(source)?.excerpt || "";
+  const normalized = body.replace(/\r\n?/g, "\n");
+  const scopeMatch = normalized.match(/under\s+([A-Z][A-Za-z0-9 /&(),.'"-]+),\s+the following changes are made:/i);
+  const scopeHeading = scopeMatch?.[1] ? normalizeWhitespace(scopeMatch[1]) : null;
+
+  const replaceItems = new Map<number, string>();
+  const deleteItems = new Set<number>();
+  const addItems: Array<{ number: number; text: string }> = [];
+
+  for (const match of normalized.matchAll(/Number\s+(\d+)\s+is\s+deleted and replaced with the following:\s*"([^"]+)"/gi)) {
+    const itemNumber = Number(match[1]);
+    const replacement = normalizeWhitespace(match[2]);
+    if (Number.isFinite(itemNumber) && replacement) {
+      replaceItems.set(itemNumber, replacement);
+    }
+  }
+
+  for (const match of normalized.matchAll(/Number\s+(\d+)\s+is\s+deleted\b(?!\s+and\s+replaced)/gi)) {
+    const itemNumber = Number(match[1]);
+    if (Number.isFinite(itemNumber)) {
+      deleteItems.add(itemNumber);
+    }
+  }
+
+  for (const match of normalized.matchAll(/a new exception is added:\s*"(\d+)\.\s*([^"]+)"/gi)) {
+    const itemNumber = Number(match[1]);
+    const text = normalizeWhitespace(match[2]);
+    if (Number.isFinite(itemNumber) && text) {
+      addItems.push({ number: itemNumber, text });
+    }
+  }
+
+  return { scopeHeading, replaceItems, deleteItems, addItems };
+}
+
+function chooseBlockForAdditions(
+  blocks: ParsedListBlock[],
+  itemNumber: number,
+  preferredHeading: string | null
+): ParsedListBlock | null {
+  if (preferredHeading) {
+    const scoped = blocks.find(
+      (block) => normalizeWhitespace(block.heading).toLowerCase() === preferredHeading.toLowerCase()
+    );
+    if (scoped) return scoped;
+  }
+
+  let best: ParsedListBlock | null = null;
+  let bestGap = Number.POSITIVE_INFINITY;
+
+  for (const block of blocks) {
+    const maxNumber = Math.max(...block.items.map((item) => item.number), 0);
+    if (maxNumber < itemNumber && itemNumber - maxNumber < bestGap) {
+      best = block;
+      bestGap = itemNumber - maxNumber;
+    }
+  }
+
+  return best ?? blocks[0] ?? null;
+}
+
+function stripLeadingAmendmentNumber(text: string): string {
+  return text.replace(/^\(\d+\)\s*/, "").trim();
+}
+
+function cleanupEditedCodeText(text: string): string {
+  return text
+    .replace(/[ \t]{2,}/g, " ")
+    .replace(/\s+([,.;:])/g, "$1")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function flexiblePhrasePattern(phrase: string): RegExp | null {
+  const normalized = normalizeWhitespace(phrase);
+  if (!normalized) return null;
+  const parts = normalized.split(/\s+/).map(escapeRegExp);
+  return new RegExp(parts.join("\\s+"), "i");
+}
+
+function replacePhraseOnce(text: string, phrase: string, replacement: string): {
+  text: string;
+  changed: boolean;
+} {
+  const pattern = flexiblePhrasePattern(phrase);
+  if (!pattern) return { text, changed: false };
+  if (!pattern.test(text)) return { text, changed: false };
+  return {
+    text: text.replace(pattern, replacement),
+    changed: true,
+  };
+}
+
+function deletePhraseOnce(text: string, phrase: string): { text: string; changed: boolean } {
+  return replacePhraseOnce(text, phrase, "");
+}
+
+function insertAfterPhraseOnce(text: string, anchor: string, insertion: string): {
+  text: string;
+  changed: boolean;
+} {
+  const pattern = flexiblePhrasePattern(anchor);
+  if (!pattern) return { text, changed: false };
+  if (!pattern.test(text)) return { text, changed: false };
+  return {
+    text: text.replace(pattern, (match) => `${match} ${insertion}`),
+    changed: true,
+  };
+}
+
+function insertBeforePhraseOnce(text: string, anchor: string, insertion: string): {
+  text: string;
+  changed: boolean;
+} {
+  const pattern = flexiblePhrasePattern(anchor);
+  if (!pattern) return { text, changed: false };
+  if (!pattern.test(text)) return { text, changed: false };
+  return {
+    text: text.replace(pattern, (match) => `${insertion} ${match}`),
+    changed: true,
+  };
+}
+
+function deleteLastSentence(text: string): { text: string; changed: boolean } {
+  const trimmed = text.trimEnd();
+  const match = trimmed.match(/([\s\S]*?)([^.!?]*[.!?])\s*$/);
+  if (!match || !match[1]) return { text, changed: false };
+  return { text: match[1].trimEnd(), changed: true };
+}
+
+function normalizeQuotedReplacement(text: string): string {
+  return normalizeWhitespace(text).replace(/^\d+\.\s+/, "");
+}
+
+function sourceFromChunk(chunk: IndexedChunk, sourceId: number): SourceRef {
+  const source: SourceRef = {
+    sourceId,
+    id: chunk.id,
+    codebookId: chunk.codebookId,
+    codebookLabel: getCodebookDef(chunk.codebookId)?.label ?? chunk.codebookId,
+    sourcePath: chunk.sourcePath,
+    sectionLabel: buildSourceLabel(chunk),
+    startLine: chunk.startLine,
+    endLine: chunk.endLine,
+  };
+  const full = getWholeSourceBodyExcerpt(source);
+  if (full) {
+    source.startLine = full.startLine;
+    source.endLine = full.endLine;
+  }
+  return source;
+}
+
+function buildAmendmentRefsFromSources(
+  amendmentSources: SourceRef[],
+  usedSources: SourceRef[]
+): AmendmentRef[] {
+  const sourceIdByPath = new Map(
+    usedSources.map((source) => [source.sourcePath, source.sourceId])
+  );
+  const out: AmendmentRef[] = [];
+
+  for (const source of amendmentSources) {
+    const sourceId = sourceIdByPath.get(source.sourcePath);
+    if (!sourceId) continue;
+    out.push({
+      sourceId,
+      id: source.id,
+      codebookId: source.codebookId,
+      codebookLabel: source.codebookLabel,
+      sourcePath: source.sourcePath,
+      sectionLabel: source.sectionLabel,
+      publicUrl: source.publicUrl,
+      startLine: source.startLine,
+      endLine: source.endLine,
+      citation: `[source ${sourceId}, lines ${source.startLine}-${source.endLine}]`,
+      fullText: getWholeSourceBodyExcerpt(source)?.excerpt || "",
+    });
+  }
+
+  return out;
+}
+
+function applyGenericAmendmentToText(
+  currentText: string,
+  amendmentText: string
+): { text: string; changed: boolean } {
+  let nextText = currentText;
+  let changed = false;
+  const amendment = stripLeadingAmendmentNumber(amendmentText.replace(/\r\n?/g, "\n"));
+
+  const wholeReplace =
+    amendment.match(
+      /\b(?:IRC,\s*)?Section\s+[A-Za-z]?\d+(?:\.\d+)*[A-Za-z]?,?\s+is\s+deleted and replaced with the following:\s*"([\s\S]+)"\.?\s*$/i
+    ) ||
+    amendment.match(/\b(?:IRC,\s*)?Section\s+[A-Za-z]?\d+(?:\.\d+)*[A-Za-z]?,?\s+is\s+amended to read as follows:\s*"([\s\S]+)"\.?\s*$/i);
+  if (wholeReplace?.[1]) {
+    return { text: cleanupEditedCodeText(wholeReplace[1]), changed: true };
+  }
+
+  if (/\b(?:IRC,\s*)?Section\s+[A-Za-z]?\d+(?:\.\d+)*[A-Za-z]?,?\s+is\s+deleted\.?\s*$/i.test(amendment)) {
+    return { text: "", changed: true };
+  }
+
+  for (const match of amendment.matchAll(
+    /\b(?:the\s+)?words?\s+"([^"]+)"\s+(?:are|is)\s+deleted and replaced with\s+(?:the\s+words?\s+)?"([^"]+)"/gi
+  )) {
+    const applied = replacePhraseOnce(nextText, match[1], match[2]);
+    nextText = applied.text;
+    changed = applied.changed || changed;
+  }
+
+  for (const match of amendment.matchAll(
+    /\b(?:the\s+)?word\s+"([^"]+)"\s+is\s+replaced with\s+(?:the\s+word\s+)?"([^"]+)"/gi
+  )) {
+    const applied = replacePhraseOnce(nextText, match[1], match[2]);
+    nextText = applied.text;
+    changed = applied.changed || changed;
+  }
+
+  for (const match of amendment.matchAll(
+    /\b(?:the\s+)?number\s+"?([^",.;]+)"?\s+is\s+(?:deleted and )?replaced with\s+"?([^",.;]+)"?/gi
+  )) {
+    const applied = replacePhraseOnce(nextText, match[1], match[2]);
+    nextText = applied.text;
+    changed = applied.changed || changed;
+  }
+
+  for (const match of amendment.matchAll(
+    /\b(?:the\s+)?words?\s+"([^"]+)"\s+(?:are|is)\s+deleted\b/gi
+  )) {
+    const applied = deletePhraseOnce(nextText, match[1]);
+    nextText = applied.text;
+    changed = applied.changed || changed;
+  }
+
+  for (const match of amendment.matchAll(/\bstrike\s+the\s+words?\s+"([^"]+)"/gi)) {
+    const applied = deletePhraseOnce(nextText, match[1]);
+    nextText = applied.text;
+    changed = applied.changed || changed;
+  }
+
+  for (const match of amendment.matchAll(
+    /\b(?:the\s+)?words?\s+"([^"]+)"\s+(?:are|is)\s+added after\s+(?:the\s+)?words?\s+"([^"]+)"/gi
+  )) {
+    const applied = insertAfterPhraseOnce(nextText, match[2], match[1]);
+    nextText = applied.text;
+    changed = applied.changed || changed;
+  }
+
+  for (const match of amendment.matchAll(
+    /\bafter\s+(?:the\s+)?words?\s+"([^"]+)"\s+add\s+(?:the\s+words?\s+)?"([^"]+)"/gi
+  )) {
+    const applied = insertAfterPhraseOnce(nextText, match[1], match[2]);
+    nextText = applied.text;
+    changed = applied.changed || changed;
+  }
+
+  for (const match of amendment.matchAll(
+    /\b(?:the\s+)?words?\s+"([^"]+)"\s+(?:are|is)\s+added before\s+(?:the\s+)?words?\s+"([^"]+)"/gi
+  )) {
+    const applied = insertBeforePhraseOnce(nextText, match[2], match[1]);
+    nextText = applied.text;
+    changed = applied.changed || changed;
+  }
+
+  for (const match of amendment.matchAll(
+    /\b(?:the\s+following\s+sentence|the\s+following)\s+is\s+added at the end of (?:the\s+)?(?:section|paragraph):\s*"([\s\S]+?)"/gi
+  )) {
+    nextText = `${nextText.trimEnd()}\n${normalizeWhitespace(match[1])}`;
+    changed = true;
+  }
+
+  for (const match of amendment.matchAll(
+    /\ba\s+new\s+(?:exception|section|subsection|number\s+\d+)\s+is\s+added(?:\s+as\s+follows)?:\s*"([\s\S]+?)"/gi
+  )) {
+    nextText = `${nextText.trimEnd()}\n${normalizeWhitespace(match[1])}`;
+    changed = true;
+  }
+
+  for (const match of amendment.matchAll(
+    /\bthe\s+following\s+exception\s+is\s+added:\s*"([\s\S]+?)"/gi
+  )) {
+    nextText = `${nextText.trimEnd()}\n${normalizeWhitespace(match[1])}`;
+    changed = true;
+  }
+
+  if (/\bthe last sentence is deleted\b/i.test(amendment)) {
+    const applied = deleteLastSentence(nextText);
+    nextText = applied.text;
+    changed = applied.changed || changed;
+  }
+
+  const deleteRestMatch = amendment.match(
+    /\bafter\s+(?:the\s+)?word\s+"([^"]+)"\s+add\s+"([^"]+)"\s+and\s+delete\s+the\s+rest\s+of\s+the\s+section/i
+  );
+  if (deleteRestMatch) {
+    const anchorPattern = flexiblePhrasePattern(deleteRestMatch[1]);
+    if (anchorPattern) {
+      const anchorMatch = anchorPattern.exec(nextText);
+      if (anchorMatch && anchorMatch.index >= 0) {
+        nextText =
+          nextText.slice(0, anchorMatch.index + anchorMatch[0].length) +
+          ` ${deleteRestMatch[2]}`;
+        changed = true;
+      }
+    }
+  }
+
+  return {
+    text: cleanupEditedCodeText(nextText),
+    changed,
+  };
+}
+
+function buildAmendedTextSectionAnswer(
+  query: string,
+  baseChunks: IndexedChunk[],
+  allChunks: IndexedChunk[],
+  amendmentCodebookId: string | undefined
+): { answer: string; sources: SourceRef[]; amendments: AmendmentRef[] } | null {
+  if (!amendmentCodebookId) return null;
+
+  const baseSectionIds = extractBaseSectionIdsFromChunks(baseChunks);
+  if (baseSectionIds.length === 0) return null;
+
+  for (const sectionId of baseSectionIds) {
+    const baseChunk = baseChunks.find((chunk) => getBaseChunkSectionId(chunk) === sectionId);
+    if (!baseChunk) continue;
+
+    const amendmentPairs = allChunks
+      .map((chunk) => chunk)
+      .filter((chunk) => chunk.codebookId === amendmentCodebookId)
+      .filter((chunk) => amendmentMentionsTargetSection(chunk, sectionId));
+    if (amendmentPairs.length === 0) continue;
+
+    const baseSource = sourceFromChunk(baseChunk, 1);
+    const baseBody = getWholeSourceBodyExcerpt(baseSource);
+    if (!baseBody?.excerpt) continue;
+
+    const amendmentSources = amendmentPairs.map((chunk, idx) =>
+      sourceFromChunk(chunk, idx + 2)
+    );
+
+    let amendedText = baseBody.excerpt;
+    let anyChanges = false;
+
+    for (const amendmentSource of amendmentSources) {
+      const amendmentBody = getWholeSourceBodyExcerpt(amendmentSource)?.excerpt || "";
+      const applied = applyGenericAmendmentToText(amendedText, amendmentBody);
+      amendedText = applied.text;
+      anyChanges = applied.changed || anyChanges;
+    }
+
+    if (!anyChanges) continue;
+
+    const sectionLabel = baseSource.sectionLabel || `Section ${sectionId}`;
+    const usedSources = dedupeSourceRefs([baseSource, ...amendmentSources]).map((source, idx) => ({
+      ...source,
+      sourceId: idx + 1,
+    }));
+
+    return {
+      answer: `${sectionLabel}\n\n${amendedText}`,
+      sources: usedSources,
+      amendments: buildAmendmentRefsFromSources(amendmentSources, usedSources),
+    };
+  }
+
+  return null;
+}
+
+function buildAmendedCodeAnswer(
+  query: string,
+  baseChunks: IndexedChunk[],
+  allChunks: IndexedChunk[],
+  amendmentCodebookId: string | undefined
+): { answer: string; sources: SourceRef[]; amendments: AmendmentRef[] } | null {
+  return (
+    buildMergedNumberedListAnswer(query, baseChunks, allChunks, amendmentCodebookId) ||
+    buildAmendedTextSectionAnswer(query, baseChunks, allChunks, amendmentCodebookId)
+  );
+}
+
+async function buildAiAssistedAmendedCodeAnswer(
+  query: string,
+  baseChunks: IndexedChunk[],
+  allChunks: IndexedChunk[],
+  amendmentCodebookId: string | undefined,
+  targetSectionIds: string[]
+): Promise<{ answer: string; sources: SourceRef[]; amendments: AmendmentRef[] } | null> {
+  if (!amendmentCodebookId) return null;
+  const uniqueTargets = Array.from(new Set(targetSectionIds));
+  if (uniqueTargets.length !== 1) return null;
+
+  const sectionId = uniqueTargets[0];
+  const baseChunk = baseChunks.find((chunk) => {
+    const chunkSectionId = getBaseChunkSectionId(chunk);
+    return chunkSectionId ? sectionMatchesExactly(chunkSectionId, sectionId) : false;
+  });
+  if (!baseChunk) return null;
+
+  const amendmentChunks = allChunks
+    .filter((chunk) => chunk.codebookId === amendmentCodebookId)
+    .filter((chunk) => amendmentMentionsTargetSection(chunk, sectionId));
+  if (amendmentChunks.length === 0) return null;
+
+  const baseSource = sourceFromChunk(baseChunk, 1);
+  const amendmentSources = amendmentChunks.map((chunk, idx) => sourceFromChunk(chunk, idx + 2));
+  const baseText = getWholeSourceBodyExcerpt(baseSource)?.excerpt || baseChunk.content || "";
+  if (!baseText.trim()) return null;
+
+  const amendmentText = amendmentSources
+    .map((source, idx) => {
+      const text = getWholeSourceBodyExcerpt(source)?.excerpt || amendmentChunks[idx]?.content || "";
+      return `Amendment ${idx + 1}:\n${text}`;
+    })
+    .join("\n\n---\n\n");
+
+  const system = `
+You compose an AI-assisted amended-code draft from provided building-code text.
+
+Rules:
+1) Use only the base section text and amendment text provided.
+2) Apply amendments as literally as possible.
+3) Preserve section labels, headings, and numbered lists when possible.
+4) Do not add legal advice, interpretation, examples, or commentary.
+5) If the base text is incomplete or too damaged to merge perfectly, still produce the best amended draft and put a short explanation in mergeNotes.
+6) Return JSON only.
+  `.trim();
+
+  const user =
+    `User question:\n${query}\n\n` +
+    `Target section:\n${sectionId}\n\n` +
+    `Base section text:\n${baseText}\n\n` +
+    `Amendments to apply:\n${amendmentText}\n\n` +
+    `Return JSON in this shape:\n` +
+    `{ "amendedText": "...", "mergeNotes": ["..."] }`;
+
+  try {
+    const response = await createChatCompletion({
+      model: CHAT_MODEL,
+      response_format: { type: "json_object" },
+      messages: [
+        { role: "system", content: system },
+        { role: "user", content: user },
+      ],
+    });
+
+    const raw = response.choices[0]?.message?.content ?? "";
+    const parsed = extractJsonObject(raw);
+    const amendedText = typeof parsed?.amendedText === "string" ? parsed.amendedText.trim() : "";
+    if (!amendedText) return null;
+
+    const mergeNotes: string[] = Array.isArray(parsed?.mergeNotes)
+      ? parsed.mergeNotes
+          .filter((note: unknown): note is string => typeof note === "string" && note.trim().length > 0)
+          .map((note: string) => note.trim())
+      : [];
+    const usedSources = dedupeSourceRefs([baseSource, ...amendmentSources]).map((source, idx) => ({
+      ...source,
+      sourceId: idx + 1,
+    }));
+
+    const lines = [
+      "AI-assisted amended code draft. Verify against the listed base and amendment sources.",
+      "",
+      baseSource.sectionLabel || `Section ${sectionId}`,
+      "",
+      amendedText,
+    ];
+    if (mergeNotes.length > 0) {
+      lines.push("", "Merge notes:", ...mergeNotes.map((note) => `- ${note}`));
+    }
+
+    return {
+      answer: lines.join("\n"),
+      sources: usedSources,
+      amendments: buildAmendmentRefsFromSources(amendmentSources, usedSources),
+    };
+  } catch (error) {
+    console.warn("[/api/ask] AI-assisted amended-code merge failed", error);
+    return null;
+  }
+}
+
+function buildMergedNumberedListAnswer(
+  query: string,
+  baseChunks: IndexedChunk[],
+  allChunks: IndexedChunk[],
+  amendmentCodebookId: string | undefined
+): { answer: string; sources: SourceRef[]; amendments: AmendmentRef[] } | null {
+  if (!amendmentCodebookId) return null;
+
+  const baseSectionIds = extractBaseSectionIdsFromChunks(baseChunks);
+  if (baseSectionIds.length === 0) return null;
+
+  const queryLower = query.toLowerCase();
+
+  for (const sectionId of baseSectionIds) {
+    const baseChunk = baseChunks.find((chunk) => getBaseChunkSectionId(chunk) === sectionId);
+    if (!baseChunk) continue;
+
+    const baseSource: SourceRef = {
+      sourceId: 1,
+      id: baseChunk.id,
+      codebookId: baseChunk.codebookId,
+      codebookLabel: getCodebookDef(baseChunk.codebookId)?.label ?? baseChunk.codebookId,
+      sourcePath: baseChunk.sourcePath,
+      sectionLabel: buildSourceLabel(baseChunk),
+      startLine: baseChunk.startLine,
+      endLine: baseChunk.endLine,
+    };
+
+    const parsedBase = parseNumberedListSection(baseSource);
+    if (!parsedBase) continue;
+
+    const amendmentPairs = allChunks
+      .map((chunk, idx) => ({ chunk, sourceId: idx + 1 }))
+      .filter(({ chunk }) => chunk.codebookId === amendmentCodebookId)
+      .filter(({ chunk }) => amendmentMentionsTargetSection(chunk, sectionId));
+
+    if (amendmentPairs.length === 0) continue;
+
+    const amendmentSources: SourceRef[] = amendmentPairs.map(({ chunk, sourceId }) => {
+      const source: SourceRef = {
+        sourceId,
+        id: chunk.id,
+        codebookId: chunk.codebookId,
+        codebookLabel: getCodebookDef(chunk.codebookId)?.label ?? chunk.codebookId,
+        sourcePath: chunk.sourcePath,
+        sectionLabel: buildSourceLabel(chunk),
+        startLine: chunk.startLine,
+        endLine: chunk.endLine,
+      };
+      const full = getWholeSourceBodyExcerpt(source);
+      if (full) {
+        source.startLine = full.startLine;
+        source.endLine = full.endLine;
+      }
+      return source;
+    });
+
+    const amendedBlocks: ParsedListBlock[] = parsedBase.blocks.map((block) => ({
+      heading: block.heading,
+      startLine: block.startLine,
+      endLine: block.endLine,
+      items: block.items.map((item) => ({ ...item })),
+    }));
+
+    let anyChanges = false;
+    let preferredHeading: string | null =
+      amendedBlocks.find((block) => queryLower.includes(block.heading.toLowerCase()))?.heading ?? null;
+
+    for (const amendmentSource of amendmentSources) {
+      const edits = parseAmendmentEdits(amendmentSource);
+      if (edits.scopeHeading && !preferredHeading) {
+        preferredHeading = edits.scopeHeading;
+      }
+
+      const targetBlocks =
+        edits.scopeHeading
+          ? amendedBlocks.filter(
+              (block) =>
+                normalizeWhitespace(block.heading).toLowerCase() ===
+                normalizeWhitespace(edits.scopeHeading || "").toLowerCase()
+            )
+          : amendedBlocks;
+
+      const appliedReplacements = new Set<number>();
+
+      for (const block of targetBlocks) {
+        block.items = block.items
+          .filter((item) => !edits.deleteItems.has(item.number))
+          .map((item) => {
+            const replacement = edits.replaceItems.get(item.number);
+            if (!replacement) return item;
+            anyChanges = true;
+            appliedReplacements.add(item.number);
+            const normalizedReplacement = replacement.match(/^\d+\.\s+/)
+              ? replacement.replace(/^\d+\.\s+/, "")
+              : replacement;
+            return { ...item, text: normalizedReplacement };
+          });
+        if (edits.deleteItems.size > 0) {
+          anyChanges = true;
+        }
+      }
+
+      for (const [itemNumber, replacement] of edits.replaceItems.entries()) {
+        if (appliedReplacements.has(itemNumber)) continue;
+        const block = chooseBlockForAdditions(
+          amendedBlocks,
+          itemNumber,
+          edits.scopeHeading || preferredHeading
+        );
+        if (!block) continue;
+        const normalizedReplacement = replacement.match(/^\d+\.\s+/)
+          ? replacement.replace(/^\d+\.\s+/, "")
+          : replacement;
+        block.items.push({
+          number: itemNumber,
+          text: normalizedReplacement,
+          startLine: amendmentSource.startLine,
+          endLine: amendmentSource.endLine,
+        });
+        block.items.sort((a, b) => a.number - b.number);
+        anyChanges = true;
+      }
+
+      for (const add of edits.addItems) {
+        const block = chooseBlockForAdditions(amendedBlocks, add.number, edits.scopeHeading || preferredHeading);
+        if (!block) continue;
+        if (!block.items.some((item) => item.number === add.number)) {
+          block.items.push({
+            number: add.number,
+            text: add.text,
+            startLine: amendmentSource.startLine,
+            endLine: amendmentSource.endLine,
+          });
+          block.items.sort((a, b) => a.number - b.number);
+          anyChanges = true;
+        }
+      }
+    }
+
+    if (!anyChanges) continue;
+
+    const targetBlock =
+      preferredHeading
+        ? amendedBlocks.find(
+            (block) =>
+              normalizeWhitespace(block.heading).toLowerCase() === preferredHeading!.toLowerCase()
+          )
+        : amendedBlocks[0];
+    if (!targetBlock) continue;
+
+    const baseBody = getWholeSourceBodyExcerpt(baseSource);
+    if (baseBody) {
+      baseSource.startLine = baseBody.startLine;
+      baseSource.endLine = baseBody.endLine;
+    }
+
+    const answerLines: string[] = [];
+    const sectionLabel = baseSource.sectionLabel || `Section ${sectionId}`;
+    answerLines.push(sectionLabel);
+    answerLines.push("");
+    if (parsedBase.intro) {
+      answerLines.push(parsedBase.intro);
+      answerLines.push("");
+    }
+    answerLines.push(`${targetBlock.heading}:`);
+    for (const item of targetBlock.items) {
+      answerLines.push(`${item.number}. ${item.text}`);
+    }
+
+    const usedSources = dedupeSourceRefs([baseSource, ...amendmentSources]).map((source, idx) => ({
+      ...source,
+      sourceId: idx + 1,
+    }));
+    const sourceIdByPath = new Map(
+      usedSources.map((source) => [source.sourcePath, source.sourceId])
+    );
+
+    const amendments: AmendmentRef[] = [];
+    for (const source of amendmentSources) {
+      const sourceId = sourceIdByPath.get(source.sourcePath);
+      if (!sourceId) continue;
+      amendments.push({
+        sourceId,
+        id: source.id,
+        codebookId: source.codebookId,
+        codebookLabel: source.codebookLabel,
+        sourcePath: source.sourcePath,
+        sectionLabel: source.sectionLabel,
+        startLine: source.startLine,
+        endLine: source.endLine,
+        citation: `[source ${sourceId}, lines ${source.startLine}-${source.endLine}]`,
+        fullText: getWholeSourceBodyExcerpt(source)?.excerpt || "",
+      });
+    }
+
+    return {
+      answer: answerLines.join("\n"),
+      sources: usedSources,
+      amendments,
+    };
+  }
+
+  return null;
+}
+
+function findPreferredSourceExcerpt(
+  source: SourceRef,
+  excerpt: string
+): { excerpt: string; startLine: number; endLine: number } | null {
+  const lines = readSourceLines(source.sourcePath);
+  if (!lines || lines.length === 0) return null;
+
+  const normalizedExcerpt = normalizeWhitespace(excerpt);
+  if (!normalizedExcerpt) return null;
+
+  const bodyStart = findBodyStartIndex(lines);
+  const contentLines = lines.slice(bodyStart);
+
+  for (let i = 0; i < contentLines.length; i++) {
+    if (!isSubheadingLine(contentLines[i].text)) continue;
+    if (i + 1 >= contentLines.length || !isOrderedListLine(contentLines[i + 1].text)) continue;
+
+    let end = i + 1;
+    while (end + 1 < contentLines.length) {
+      const next = contentLines[end + 1];
+      const nextNext = contentLines[end + 2];
+      if (
+        isSubheadingLine(next.text) &&
+        nextNext &&
+        isOrderedListLine(nextNext.text)
+      ) {
+        break;
+      }
+      end += 1;
+    }
+
+    const block = extractBlockText(contentLines, i, end);
+    if (!block) continue;
+    if (normalizeWhitespace(block.excerpt).includes(normalizedExcerpt)) {
+      return block;
+    }
+  }
+
+  const bodyBlock = extractBlockText(contentLines, 0, contentLines.length - 1);
+  if (!bodyBlock) return null;
+  if (normalizeWhitespace(bodyBlock.excerpt).includes(normalizedExcerpt)) {
+    return bodyBlock;
+  }
+
+  return null;
+}
+
+function expandSelectedAgainstSourceFiles(
+  selected: SelectorResult,
+  sources: SourceRef[]
+): { selected: SelectorResult; sources: SourceRef[] } {
+  const clonedSources = sources.map((source) => ({ ...source }));
+  const seenByKey = new Set<string>();
+
+  const expandedSections = selected.sections
+    .map((section) => {
+      const items: ExpandedQuote[] = [];
+
+      for (const item of section.items) {
+        const source = clonedSources[item.sourceId - 1];
+        const expanded =
+          source && !source.isTable
+            ? findPreferredSourceExcerpt(source, item.excerpt)
+            : null;
+
+        const nextItem: ExpandedQuote = expanded
+          ? {
+              sourceId: item.sourceId,
+              excerpt: expanded.excerpt,
+              startLine: expanded.startLine,
+              endLine: expanded.endLine,
+            }
+          : item;
+
+        if (expanded && source) {
+          source.startLine = expanded.startLine;
+          source.endLine = expanded.endLine;
+        }
+
+        const key = `${item.sourceId}:${normalizeWhitespace(nextItem.excerpt)}`;
+        if (seenByKey.has(key)) continue;
+        seenByKey.add(key);
+        items.push(nextItem);
+      }
+
+      return {
+        title: section.title,
+        items,
+      };
+    })
+    .filter((section) => section.items.length > 0);
+
+  return {
+    selected: { sections: expandedSections },
+    sources: clonedSources,
+  };
+}
+
+function forceIncludeMatchedAmendments(
+  selected: SelectorResult,
+  sources: SourceRef[],
+  chunks: IndexedChunk[],
+  targetSectionIds: string[]
+): { selected: SelectorResult; sources: SourceRef[] } {
+  if (targetSectionIds.length === 0) {
+    return { selected, sources };
+  }
+
+  const wanted = new Set(targetSectionIds);
+  const outSources = sources.map((source) => ({ ...source }));
+  const sections = selected.sections.map((section) => ({
+    title: section.title,
+    items: [...section.items],
+  }));
+  const existingIds = new Set(
+    sections.flatMap((section) => section.items.map((item) => item.sourceId))
+  );
+
+  const forcedItems: ExpandedQuote[] = [];
+
+  for (let i = 0; i < chunks.length; i++) {
+    const chunk = chunks[i];
+    if (chunk.codebookId !== "irc-utah-2021-amendments") continue;
+    const info = getAmendmentInfo(chunk);
+    if (!info.targetSectionId || !wanted.has(info.targetSectionId)) continue;
+
+    const sourceId = i + 1;
+    if (existingIds.has(sourceId)) continue;
+
+    const source = outSources[sourceId - 1];
+    if (!source) continue;
+
+    const wholeBody = getWholeSourceBodyExcerpt(source);
+    if (wholeBody) {
+      source.startLine = wholeBody.startLine;
+      source.endLine = wholeBody.endLine;
+      forcedItems.push({
+        sourceId,
+        excerpt: wholeBody.excerpt,
+        startLine: wholeBody.startLine,
+        endLine: wholeBody.endLine,
+      });
+    } else {
+      forcedItems.push({
+        sourceId,
+        excerpt: chunk.content,
+      });
+    }
+    existingIds.add(sourceId);
+  }
+
+  if (forcedItems.length === 0) {
+    return { selected, sources: outSources };
+  }
+
+  const amendmentTitle =
+    targetSectionIds.length === 1
+      ? `Amendments to Section ${targetSectionIds[0]}`
+      : "Amendments";
+
+  sections.push({
+    title: amendmentTitle,
+    items: forcedItems,
+  });
+
+  return {
+    selected: { sections },
+    sources: outSources,
+  };
+}
+
+function buildExtractiveAnswerFromSelected(
+  selected: SelectorResult,
+  sources: SourceRef[]
+): string | null {
+  const out: string[] = [];
+
+  for (const section of selected.sections) {
+    out.push(section.title);
+    out.push("");
+
+    for (const item of section.items) {
+      const src = sources[item.sourceId - 1];
+      if (!src) continue;
+      out.push(`[source ${item.sourceId}, lines ${src.startLine}-${src.endLine}]`);
+      out.push(item.excerpt);
+      out.push("");
+    }
+  }
+
+  while (out.length > 0 && out[out.length - 1].trim() === "") out.pop();
+  return out.length > 0 ? out.join("\n") : null;
+}
+
+function shouldPreferExtractiveAnswer(selected: SelectorResult): boolean {
+  return selected.sections.some((section) =>
+    section.items.some(
+      (item) =>
+        item.excerpt.length > 350 ||
+        item.excerpt.split(/\r?\n/).some((line) => isOrderedListLine(line))
+    )
+  );
+}
+
 function extractExplicitTableRef(query: string): string | null {
   const match = normalizeWhitespace(query).match(
     /\btable\s+([A-Za-z]?\d+(?:\.\d+)*(?:\([0-9A-Za-z]+\))?)/i
   );
   return match?.[1] ? match[1].toUpperCase() : null;
+}
+
+function extractExplicitSectionRef(query: string): string | null {
+  const text = normalizeWhitespace(query);
+  const labeled = text.match(/\b(?:section|sec\.?|§)\s+([A-Za-z]?\d+(?:\.\d+)*)/i);
+  const raw = labeled?.[1] ?? text.match(/\b([RPEGMN]\d{3,}(?:\.\d+)*)\b/i)?.[1];
+  return raw ? normalizeIrcSectionId(raw) : null;
+}
+
+function extractBaseSectionIdsFromChunks(chunks: IndexedChunk[]): string[] {
+  const ids = new Set<string>();
+
+  for (const chunk of chunks) {
+    const normalizedChunkId = getBaseChunkSectionId(chunk);
+    if (normalizedChunkId) {
+      ids.add(normalizedChunkId);
+    }
+  }
+
+  return Array.from(ids);
+}
+
+function normalizeSectionForMatch(value: string | null | undefined): string | null {
+  const normalized = value ? normalizeIrcSectionId(value) : null;
+  if (!normalized) return null;
+  return normalized.toUpperCase();
+}
+
+function sectionNumberPart(value: string | null | undefined): string | null {
+  const normalized = normalizeSectionForMatch(value);
+  if (!normalized) return null;
+  return normalized.replace(/^[A-Z]+/, "");
+}
+
+function sectionMatchesTarget(candidate: string | null | undefined, target: string): boolean {
+  const normalizedCandidate = normalizeSectionForMatch(candidate);
+  const normalizedTarget = normalizeSectionForMatch(target);
+  if (!normalizedCandidate || !normalizedTarget) return false;
+  if (normalizedCandidate === normalizedTarget) return true;
+  const candidateNumber = sectionNumberPart(normalizedCandidate);
+  const targetNumber = sectionNumberPart(normalizedTarget);
+  return Boolean(candidateNumber && targetNumber && candidateNumber === targetNumber);
+}
+
+function sectionMatchesExactly(candidate: string | null | undefined, target: string): boolean {
+  const normalizedCandidate = normalizeSectionForMatch(candidate);
+  const normalizedTarget = normalizeSectionForMatch(target);
+  return Boolean(normalizedCandidate && normalizedTarget && normalizedCandidate === normalizedTarget);
+}
+
+function compareSectionNumber(a: string, b: string): number {
+  const aParts = (sectionNumberPart(a) || "").split(".").map((part) => Number.parseInt(part, 10));
+  const bParts = (sectionNumberPart(b) || "").split(".").map((part) => Number.parseInt(part, 10));
+  const len = Math.max(aParts.length, bParts.length);
+  for (let i = 0; i < len; i++) {
+    const av = Number.isFinite(aParts[i]) ? aParts[i] : 0;
+    const bv = Number.isFinite(bParts[i]) ? bParts[i] : 0;
+    if (av !== bv) return av - bv;
+  }
+  return 0;
+}
+
+function sectionRangeIncludes(start: string, end: string, target: string): boolean {
+  const normalizedStart = normalizeSectionForMatch(start);
+  const normalizedEnd = normalizeSectionForMatch(end);
+  const normalizedTarget = normalizeSectionForMatch(target);
+  if (!normalizedStart || !normalizedEnd || !normalizedTarget) return false;
+  const startPrefix = normalizedStart.match(/^[A-Z]+/)?.[0] || "";
+  const endPrefix = normalizedEnd.match(/^[A-Z]+/)?.[0] || startPrefix;
+  const targetPrefix = normalizedTarget.match(/^[A-Z]+/)?.[0] || startPrefix;
+  if (startPrefix && targetPrefix && startPrefix !== targetPrefix && endPrefix !== targetPrefix) {
+    return false;
+  }
+  return (
+    compareSectionNumber(normalizedStart, normalizedTarget) <= 0 &&
+    compareSectionNumber(normalizedTarget, normalizedEnd) <= 0
+  );
+}
+
+function amendmentMentionsTargetSection(chunk: IndexedChunk, targetSectionId: string): boolean {
+  const info = getAmendmentInfo(chunk);
+  if (info.targetSectionId && sectionMatchesTarget(info.targetSectionId, targetSectionId)) {
+    return true;
+  }
+
+  const haystack = `${chunk.sourcePath || ""}\n${chunk.content || ""}`;
+  const targetNumber = sectionNumberPart(targetSectionId);
+  if (!targetNumber) return false;
+
+  const directSectionPattern = new RegExp(
+    `\\b(?:Section|Sections|IRC Section|IRC, Section)\\s+[A-Z]?${targetNumber.replace(/\./g, "\\.")}\\b`,
+    "i"
+  );
+  if (directSectionPattern.test(haystack)) return true;
+
+  const filenamePattern = new RegExp(
+    `[_\\s(][A-Z]?${targetNumber.replace(/\./g, "\\.")}(?:[_)\\s.]|$)`,
+    "i"
+  );
+  if (filenamePattern.test(haystack)) return true;
+
+  for (const match of haystack.matchAll(
+    /\bSections?\s+([A-Za-z]?\d+(?:\.\d+)*)\s+through\s+([A-Za-z]?\d+(?:\.\d+)*)/gi
+  )) {
+    if (sectionRangeIncludes(match[1], match[2], targetSectionId)) return true;
+  }
+
+  return false;
+}
+
+function getBaseChunkSectionId(chunk: IndexedChunk): string | null {
+  const meta = (chunk as any).meta ?? {};
+  const rawMetaId =
+    typeof meta.sectionId === "string"
+      ? meta.sectionId
+      : typeof meta.sectionLabel === "string"
+      ? meta.sectionLabel
+      : null;
+
+  const normalizedMetaId = rawMetaId
+    ? normalizeIrcSectionId(
+        rawMetaId.replace(/^Section\s+/i, "").split(/\s+-\s+/, 1)[0].trim()
+      )
+    : null;
+  if (normalizedMetaId) {
+    return normalizedMetaId;
+  }
+
+  const baseName = path.basename(chunk.sourcePath || "", path.extname(chunk.sourcePath || ""));
+  const match = baseName.match(/section_([A-Za-z]?\d+(?:\.\d+)*)/i);
+  const normalizedPathId = match?.[1] ? normalizeIrcSectionId(match[1]) : null;
+  if (normalizedPathId) {
+    return normalizedPathId;
+  }
+
+  const firstLine = String(chunk.content || "")
+    .split(/\r?\n/, 1)[0]
+    ?.trim();
+  const firstLineMatch = firstLine?.match(/^([A-Za-z]?\d+(?:\.\d+)*)\b/);
+  const normalizedFirstLineId = firstLineMatch?.[1]
+    ? normalizeIrcSectionId(firstLineMatch[1])
+    : null;
+  if (normalizedFirstLineId) {
+    return normalizedFirstLineId;
+  }
+
+  return null;
+}
+
+function buildSourceLabel(chunk: IndexedChunk): string | undefined {
+  const meta = (chunk as any).meta ?? {};
+  const explicitLabel =
+    typeof meta.sectionLabel === "string"
+      ? meta.sectionLabel
+      : typeof meta.header === "string"
+      ? meta.header
+      : undefined;
+  if (explicitLabel) return explicitLabel;
+
+  const inferredSectionId = getBaseChunkSectionId(chunk);
+  if (inferredSectionId) {
+    return `Section ${inferredSectionId}`;
+  }
+
+  const tableAsset = getTableAssetInfoForSource({
+    codebookId: chunk.codebookId,
+    sourcePath: chunk.sourcePath,
+    meta,
+  });
+  if (tableAsset?.tableLabel) {
+    return tableAsset.tableLabel;
+  }
+
+  return undefined;
+}
+
+function findAmendmentChunksByBaseSections(
+  amendmentCodebookId: string,
+  baseChunks: IndexedChunk[],
+): IndexedChunk[] {
+  const targetSectionIds = new Set(extractBaseSectionIdsFromChunks(baseChunks));
+  if (targetSectionIds.size === 0) return [];
+
+  try {
+    const amendmentIndex = loadCodebookIndex(amendmentCodebookId);
+    const matched = amendmentIndex.filter((chunk) => {
+      for (const targetSectionId of targetSectionIds) {
+        if (amendmentMentionsTargetSection(chunk, targetSectionId)) return true;
+      }
+      return false;
+    });
+    return dedupeChunks(matched);
+  } catch (error) {
+    console.warn("[/api/ask] amendment by base-section lookup failed", {
+      amendmentCodebookId,
+      targetSectionIds: Array.from(targetSectionIds),
+      error,
+    });
+    return [];
+  }
 }
 
 function normalizeTableIdentity(value: string | null | undefined): string {
@@ -204,6 +1589,29 @@ function findExplicitTableChunks(
     ).slice(0, limit);
   } catch (error) {
     console.warn("[/api/ask] explicit table lookup failed", { codebookId, tableRef, error });
+    return [];
+  }
+}
+
+function findExplicitSectionChunks(
+  codebookId: string,
+  sectionRef: string,
+  limit = 8
+): IndexedChunk[] {
+  try {
+    const chunks = loadCodebookIndex(codebookId);
+    return dedupeChunks(
+      chunks.filter((chunk) => {
+        const sectionId = getBaseChunkSectionId(chunk);
+        return sectionId ? sectionMatchesExactly(sectionId, sectionRef) : false;
+      })
+    ).slice(0, limit);
+  } catch (error) {
+    console.warn("[/api/ask] explicit section lookup failed", {
+      codebookId,
+      sectionRef,
+      error,
+    });
     return [];
   }
 }
@@ -309,7 +1717,7 @@ function buildDeterministicSelectorFallback(
     }
 
     if (bestScore > 0 && bestExcerpt) {
-      const excerpt = bestExcerpt.slice(0, 1400).trim();
+      const excerpt = bestExcerpt.slice(0, 6000).trim();
       if (excerpt) {
         scored.push({ sourceId, excerpt, score: bestScore });
       }
@@ -404,7 +1812,7 @@ function validateSelectorResult(
       }
 
       // Prevent huge dumps
-      if (ex.length > 1400) {
+      if (ex.length > 6000) {
         lastSelectorValidationFailReason = "excerpt too long";
         continue;
       }
@@ -458,22 +1866,7 @@ function buildFallbackAnswerFromSelected(
   selected: SelectorResult,
   sources: SourceRef[]
 ): string | null {
-  const sentences: string[] = [];
-  const maxSentences = 3;
-
-  for (const sec of selected.sections) {
-    for (const item of sec.items) {
-      if (sentences.length >= maxSentences) break;
-      const src = sources[item.sourceId - 1];
-      if (!src) continue;
-      const quote = item.excerpt;
-      const cite = `[source ${item.sourceId}, lines ${src.startLine}-${src.endLine}]`;
-      sentences.push(`The code states: "${quote}" ${cite}.`);
-    }
-    if (sentences.length >= maxSentences) break;
-  }
-
-  return sentences.length > 0 ? sentences.join(" ") : null;
+  return buildExtractiveAnswerFromSelected(selected, sources);
 }
 
 function getLastUserQuery(history: { role: string; query?: string }[]): string | null {
@@ -520,17 +1913,12 @@ function buildContext(
     const sourceId = idx + 1;
 
     const meta = (chunk as any).meta ?? {};
-    const rawSectionLabel: string | undefined =
-      typeof meta.sectionLabel === "string" ? meta.sectionLabel :
-      typeof meta.header === "string" ? meta.header :
-      typeof meta.sectionId === "string" ? meta.sectionId :
-      undefined;
     const tableAsset = getTableAssetInfoForSource({
       codebookId: chunk.codebookId,
       sourcePath: chunk.sourcePath,
       meta,
     });
-    const sectionLabel = rawSectionLabel || tableAsset?.tableLabel || undefined;
+    const sectionLabel = buildSourceLabel(chunk) || tableAsset?.tableLabel || undefined;
 
     const publicUrl: string | undefined =
       typeof meta.publicUrl === "string" ? meta.publicUrl : undefined;
@@ -573,17 +1961,12 @@ function buildQuotesRaw(chunks: IndexedChunk[]): { answer: string; sources: Sour
     const sourceId = idx + 1;
     const meta = (chunk as any).meta ?? {};
 
-    const rawSectionLabel: string | undefined =
-      typeof meta.sectionLabel === "string" ? meta.sectionLabel :
-      typeof meta.header === "string" ? meta.header :
-      typeof meta.sectionId === "string" ? meta.sectionId :
-      undefined;
     const tableAsset = getTableAssetInfoForSource({
       codebookId: chunk.codebookId,
       sourcePath: chunk.sourcePath,
       meta,
     });
-    const sectionLabel = rawSectionLabel || tableAsset?.tableLabel || undefined;
+    const sectionLabel = buildSourceLabel(chunk) || tableAsset?.tableLabel || undefined;
 
     const publicUrl: string | undefined =
       typeof meta.publicUrl === "string" ? meta.publicUrl : undefined;
@@ -962,8 +2345,10 @@ export async function POST(request: Request) {
 
   const structuralRef = extractStructureFromQuery(query);
   const explicitTableRef = extractExplicitTableRef(query);
+  const explicitSectionRef = extractExplicitSectionRef(query);
   console.log("[/api/ask] structuralRef", structuralRef);
   console.log("[/api/ask] explicitTableRef", explicitTableRef);
+  console.log("[/api/ask] explicitSectionRef", explicitSectionRef);
 
   // ----------------------------
   // Retrieve base + amendments
@@ -975,16 +2360,29 @@ export async function POST(request: Request) {
     amendmentCodebookId,
   });
 
-  const baseChunks = await searchCodebook({
+  const searchedBaseChunks = await searchCodebook({
     query: effectiveQuery,
     codebookId: baseCodebookId,
     topK,
   });
 
+  const explicitSectionChunks =
+    explicitSectionRef !== null
+      ? findExplicitSectionChunks(baseCodebookId, explicitSectionRef, topK)
+      : [];
+
+  const baseChunks = dedupeChunks([
+    ...explicitSectionChunks,
+    ...searchedBaseChunks,
+  ]);
+
   const explicitTableChunks =
     explicitTableRef !== null
       ? findExplicitTableChunks(baseCodebookId, explicitTableRef, topK)
       : [];
+  const amendmentAnchorChunks =
+    explicitSectionChunks.length > 0 ? explicitSectionChunks : baseChunks;
+  const baseSectionIds = extractBaseSectionIdsFromChunks(amendmentAnchorChunks);
 
   console.log(
     "[/api/ask] baseChunks",
@@ -1011,8 +2409,18 @@ export async function POST(request: Request) {
               })
             : [];
 
-        if (structuralAmendmentChunks.length > 0) {
-          amendmentChunks = structuralAmendmentChunks.slice(0, topK);
+        const baseAnchoredAmendmentChunks = findAmendmentChunksByBaseSections(
+          amendmentCodebookId,
+          amendmentAnchorChunks
+        );
+
+        const deterministicAmendmentChunks = dedupeChunks([
+          ...structuralAmendmentChunks,
+          ...baseAnchoredAmendmentChunks,
+        ]);
+
+        if (deterministicAmendmentChunks.length > 0) {
+          amendmentChunks = deterministicAmendmentChunks;
         } else {
           amendmentChunks = await searchCodebook({
             query: effectiveQuery,
@@ -1030,6 +2438,7 @@ export async function POST(request: Request) {
     if (amendmentChunks.length === 0) {
       console.warn("NO AMENDMENT CHUNKS RETRIEVED (check mapping/index/query).");
     }
+    console.log("[/api/ask] amendment target sections", baseSectionIds);
     console.log(
       "[/api/ask] amendmentChunks",
       amendmentChunks.length,
@@ -1056,11 +2465,7 @@ export async function POST(request: Request) {
     filteredBaseChunks = [];
   } else if (excludedSectionIds.size > 0) {
     filteredBaseChunks = filteredBaseChunks.filter((chunk) => {
-      const meta = (chunk as any).meta ?? {};
-      const sectionIdRaw =
-        typeof meta.sectionId === "string" ? meta.sectionId : null;
-      if (!sectionIdRaw) return true;
-      const sectionId = normalizeIrcSectionId(sectionIdRaw);
+      const sectionId = getBaseChunkSectionId(chunk);
       return sectionId === null || !excludedSectionIds.has(sectionId);
     });
   }
@@ -1096,6 +2501,72 @@ export async function POST(request: Request) {
           ...(directTableSource ? [directTableSource] : []),
         ]).map((src, idx) => ({ ...src, sourceId: idx + 1 }))
       : [];
+
+  const amendedCodeAnswer = buildAmendedCodeAnswer(
+    query,
+    filteredBaseChunks,
+    allChunks,
+    amendmentCodebookId
+  );
+  if (amendedCodeAnswer) {
+    const aiSummary = await generateAiSummary(query, amendedCodeAnswer.answer);
+    console.log("[/api/ask] summary", {
+      baseChunks: baseChunks.length,
+      amendmentChunks: amendmentChunks.length,
+      allChunks: allChunks.length,
+      selectorSelected: false,
+      reason: "deterministic amended-code merge",
+    });
+
+    return NextResponse.json(
+      {
+        ok: true,
+        query,
+        codebookId: baseCodebookId,
+        answer: amendedCodeAnswer.answer,
+        aiSummary,
+        aiSummaryDisclaimer: aiSummary ? SUMMARY_DISCLAIMER : null,
+        sources: amendedCodeAnswer.sources,
+        amendments: amendedCodeAnswer.amendments,
+      },
+      { status: 200 }
+    );
+  }
+
+  const aiAssistedAmendedCodeAnswer = await buildAiAssistedAmendedCodeAnswer(
+    query,
+    filteredBaseChunks,
+    allChunks,
+    amendmentCodebookId,
+    baseSectionIds
+  );
+  if (aiAssistedAmendedCodeAnswer) {
+    const aiSummary = await generateAiSummary(
+      query,
+      aiAssistedAmendedCodeAnswer.answer
+    );
+    console.log("[/api/ask] summary", {
+      baseChunks: baseChunks.length,
+      amendmentChunks: amendmentChunks.length,
+      allChunks: allChunks.length,
+      selectorSelected: false,
+      reason: "ai-assisted amended-code merge",
+    });
+
+    return NextResponse.json(
+      {
+        ok: true,
+        query,
+        codebookId: baseCodebookId,
+        answer: aiAssistedAmendedCodeAnswer.answer,
+        aiSummary,
+        aiSummaryDisclaimer: aiSummary ? SUMMARY_DISCLAIMER : null,
+        sources: aiAssistedAmendedCodeAnswer.sources,
+        amendments: aiAssistedAmendedCodeAnswer.amendments,
+      },
+      { status: 200 }
+    );
+  }
 
   if (allChunks.length === 0) {
     console.log("[/api/ask] summary", {
@@ -1139,6 +2610,8 @@ export async function POST(request: Request) {
     6) Each section may contain up to 6 excerpts.
     7) Return { "cannotAnswer": true } ONLY if you cannot find ANY relevant verbatim excerpts related to the question.
     8) You may select relevant excerpts even if they do not support a definitive yes/no conclusion.
+    9) If a relevant excerpt is part of a numbered or lettered list, prefer the ENTIRE list block from its heading through the last list item before the next heading.
+    10) Otherwise, prefer the full relevant subsection/body text over a tiny snippet.
 
     Output format (and no other format is allowed):
 
@@ -1231,7 +2704,7 @@ export async function POST(request: Request) {
   let selectorJsonParsed = false;
 
   try {
-    const sel = await openai.chat.completions.create({
+    const sel = await createChatCompletion({
       model: CHAT_MODEL,
       response_format: { type: "json_object" },
       messages: [
@@ -1298,8 +2771,18 @@ export async function POST(request: Request) {
     );
   }
 
+  const expanded = expandSelectedAgainstSourceFiles(selected, srcs);
+  const forced = forceIncludeMatchedAmendments(
+    expanded.selected,
+    expanded.sources,
+    allChunks,
+    baseSectionIds
+  );
+  selected = forced.selected;
+  const answerSources = forced.sources;
 
-  const organizedAnswer = renderOrganizedQuotes(selected, srcs);
+  const organizedAnswer = renderOrganizedQuotes(selected, answerSources);
+  const preferExtractiveAnswer = shouldPreferExtractiveAnswer(selected);
 
   // ----------------------------
   // Answer model: sentence format, but every definitive sentence must quote + cite
@@ -1317,25 +2800,27 @@ export async function POST(request: Request) {
 
   let finalAnswer = organizedAnswer; // fallback if model fails
 
-  try {
-    const ans = await openai.chat.completions.create({
-      model: CHAT_MODEL,
-      messages: [
-        { role: "system", content: ANSWER_SYSTEM_PROMPT },
-        { role: "user", content: answerUser },
-      ],
-      temperature: 0,
-    });
+  if (!preferExtractiveAnswer) {
+    try {
+      const ans = await createChatCompletion({
+        model: CHAT_MODEL,
+        messages: [
+          { role: "system", content: ANSWER_SYSTEM_PROMPT },
+          { role: "user", content: answerUser },
+        ],
+        temperature: 0,
+      });
 
-    finalAnswer = ans.choices[0]?.message?.content?.trim() || finalAnswer;
-  } catch (e) {
-    console.warn("ANSWER MODEL FAILED:", e);
-    finalAnswer = organizedAnswer;
+      finalAnswer = ans.choices[0]?.message?.content?.trim() || finalAnswer;
+    } catch (e) {
+      console.warn("ANSWER MODEL FAILED:", e);
+      finalAnswer = organizedAnswer;
+    }
   }
 
   // 🔒 ENFORCEMENT GOES HERE (after model runs)
-  if (!validateFinalAnswerOrFail(finalAnswer)) {
-    const fallback = buildFallbackAnswerFromSelected(selected, srcs);
+  if (!preferExtractiveAnswer && !validateFinalAnswerOrFail(finalAnswer)) {
+    const fallback = buildFallbackAnswerFromSelected(selected, answerSources);
     if (fallback && validateFinalAnswerOrFail(fallback)) {
       finalAnswer = fallback;
     } else {
@@ -1372,7 +2857,7 @@ export async function POST(request: Request) {
       ? { answer: finalAnswer, usedSources: [] }
       : buildUsedSourcesAndRewrite(
           finalAnswer,
-          srcs,
+          answerSources,
           contentBySourceId,
           process.env.DEBUG_SOURCES === "1"
         );
@@ -1423,12 +2908,15 @@ export async function POST(request: Request) {
     usedSources,
     chunksByPath
   );
+  const aiSummary = await generateAiSummary(query, finalAnswer);
 
   const res: AskResponse = {
     ok: true,
     query,
     codebookId: baseCodebookId,
     answer: finalAnswer,
+    aiSummary,
+    aiSummaryDisclaimer: aiSummary ? SUMMARY_DISCLAIMER : null,
     sources: usedSources,
     amendments: amendmentRefs,
   };

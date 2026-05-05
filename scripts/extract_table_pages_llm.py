@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 
-DEFAULT_MODEL = os.environ.get("OPENAI_TABLE_MODEL") or os.environ.get("OPENAI_MODEL") or "gpt-4o-mini"
+DEFAULT_MODEL = os.environ.get("OPENAI_TABLE_MODEL") or os.environ.get("OPENAI_MODEL") or "gpt-5.5"
 SYSTEM_PROMPT = """You classify pages from building-code PDFs.
 
 Determine whether the page is a full-page table, meaning the page is primarily a grid of rows and columns.
