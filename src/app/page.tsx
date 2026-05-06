@@ -36,6 +36,30 @@ type AmendmentRef = {
   fullText: string;
 };
 
+type DefinitionSource = {
+  id: string;
+  codebookId: string;
+  codebookLabel: string;
+  sourcePath: string;
+  sectionLabel?: string;
+  publicUrl?: string;
+  startLine: number;
+  endLine: number;
+  fullText?: string;
+};
+
+type DefinitionRef = {
+  term: string;
+  definition: string;
+  baseDefinition?: string | null;
+  amendedDefinition?: string | null;
+  isAmended: boolean;
+  matchReason: "query" | "answer";
+  source?: DefinitionSource;
+  amendmentSources: DefinitionSource[];
+  mergeNotes?: string[];
+};
+
 type AskResponse = {
   ok: boolean;
   query: string;
@@ -43,6 +67,7 @@ type AskResponse = {
   answer: string | null;
   aiSummary?: string | null;
   aiSummaryDisclaimer?: string | null;
+  definitions?: DefinitionRef[];
   sources: SourceRef[];
   amendments: AmendmentRef[];
   reason?: string;
@@ -53,9 +78,11 @@ export default function HomePage() {
   const [query, setQuery] = useState("");
   const [codebookId, setCodebookId] = useState("irc-utah-2021");
   const [includeAmendments, setIncludeAmendments] = useState(true);
+  const [showDefinitions, setShowDefinitions] = useState(true);
   const [answer, setAnswer] = useState<string | null>(null);
   const [aiSummary, setAiSummary] = useState<string | null>(null);
   const [aiSummaryDisclaimer, setAiSummaryDisclaimer] = useState<string | null>(null);
+  const [definitions, setDefinitions] = useState<DefinitionRef[]>([]);
   const [sources, setSources] = useState<SourceRef[]>([]);
   const [amendments, setAmendments] = useState<AmendmentRef[]>([]);
   const [loading, setLoading] = useState(false);
@@ -152,6 +179,7 @@ export default function HomePage() {
     setAnswer(null);
     setAiSummary(null);
     setAiSummaryDisclaimer(null);
+    setDefinitions([]);
     setSources([]);
     setAmendments([]);
 
@@ -184,6 +212,7 @@ export default function HomePage() {
         setAnswer(null);
         setAiSummary(null);
         setAiSummaryDisclaimer(null);
+        setDefinitions(data.definitions || []);
         setSources(data.sources || []);
         setAmendments(data.amendments || []);
         setError(
@@ -198,6 +227,7 @@ export default function HomePage() {
       setAnswer(data.answer || null);
       setAiSummary(data.aiSummary || null);
       setAiSummaryDisclaimer(data.aiSummaryDisclaimer || null);
+      setDefinitions(data.definitions || []);
       setSources(
         filterSourcesByAnswer(data.sources || [], data.answer || null, trimmed)
       );
@@ -295,6 +325,20 @@ export default function HomePage() {
             type="checkbox"
             checked={includeAmendments}
             onChange={(e) => setIncludeAmendments(e.target.checked)}
+            style={{
+              marginLeft: "0.5rem",
+              transform: "scale(1.2)",
+              cursor: "pointer",
+            }}
+          />
+        </label>
+
+        <label style={{ fontWeight: 500 }}>
+          Show Definitions
+          <input
+            type="checkbox"
+            checked={showDefinitions}
+            onChange={(e) => setShowDefinitions(e.target.checked)}
             style={{
               marginLeft: "0.5rem",
               transform: "scale(1.2)",
@@ -460,6 +504,125 @@ export default function HomePage() {
                     "AI-generated plain-language summary. It is not the official code text and may be incomplete or inaccurate."}
                 </div>
                 {aiSummary}
+              </div>
+            </section>
+          )}
+
+          {showDefinitions && definitions.length > 0 && (
+            <section style={{ marginBottom: "1.5rem" }}>
+              <h2
+                style={{
+                  fontSize: "1.25rem",
+                  fontWeight: 600,
+                  marginBottom: "0.5rem",
+                }}
+              >
+                Definitions Used
+              </h2>
+              <div
+                style={{
+                  borderRadius: "4px",
+                  border: "1px solid #c7d2fe",
+                  padding: "0.75rem",
+                  backgroundColor: "#eef2ff",
+                }}
+              >
+                {definitions.map((definition) => {
+                  const source = definition.source;
+                  const sourceLink =
+                    source?.publicUrl ||
+                    (source?.sourcePath?.startsWith("http")
+                      ? source.sourcePath
+                      : undefined);
+                  return (
+                    <div
+                      key={`${definition.term}-${definition.matchReason}`}
+                      style={{
+                        marginBottom: "0.9rem",
+                        paddingBottom: "0.9rem",
+                        borderBottom: "1px solid #dbe4ff",
+                      }}
+                    >
+                      <div style={{ fontWeight: 700, marginBottom: "0.25rem" }}>
+                        {definition.term}
+                        {definition.isAmended ? " (amended)" : ""}
+                      </div>
+                      <div
+                        style={{
+                          whiteSpace: "pre-wrap",
+                          lineHeight: 1.45,
+                          fontSize: "0.92rem",
+                        }}
+                      >
+                        {definition.definition}
+                      </div>
+                      {source && (
+                        <div
+                          style={{
+                            fontSize: "0.82rem",
+                            color: "#4b5563",
+                            marginTop: "0.35rem",
+                          }}
+                        >
+                          Base source:{" "}
+                          {sourceLink ? (
+                            <a href={sourceLink} target="_blank" rel="noreferrer">
+                              {source.sectionLabel || source.sourcePath}
+                            </a>
+                          ) : (
+                            source.sectionLabel || source.sourcePath
+                          )}
+                          , lines {source.startLine}-{source.endLine}
+                        </div>
+                      )}
+                      {definition.amendmentSources.length > 0 && (
+                        <div
+                          style={{
+                            fontSize: "0.82rem",
+                            color: "#4b5563",
+                            marginTop: "0.25rem",
+                          }}
+                        >
+                          Amendment source{definition.amendmentSources.length > 1 ? "s" : ""}:{" "}
+                          {definition.amendmentSources.map((amendment, index) => {
+                            const link =
+                              amendment.publicUrl ||
+                              (amendment.sourcePath?.startsWith("http")
+                                ? amendment.sourcePath
+                                : undefined);
+                            const label = amendment.sectionLabel || amendment.sourcePath;
+                            return (
+                              <span key={`${amendment.sourcePath}-${amendment.startLine}`}>
+                                {index > 0 ? "; " : ""}
+                                {link ? (
+                                  <a href={link} target="_blank" rel="noreferrer">
+                                    {label}
+                                  </a>
+                                ) : (
+                                  label
+                                )}
+                                , lines {amendment.startLine}-{amendment.endLine}
+                              </span>
+                            );
+                          })}
+                        </div>
+                      )}
+                      {definition.mergeNotes && definition.mergeNotes.length > 0 && (
+                        <div
+                          style={{
+                            fontSize: "0.82rem",
+                            color: "#92400e",
+                            marginTop: "0.35rem",
+                          }}
+                        >
+                          {definition.mergeNotes.map((note) => (
+                            <div key={note}>Merge note: {note}</div>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
               </div>
             </section>
           )}

@@ -175,19 +175,23 @@ export function resolveTableAssetForRef(
   codebookId: string,
   tableRef: string
 ): ResolvedTableAsset | null {
+  return resolveTableAssetsForRef(codebookId, tableRef)[0] ?? null;
+}
+
+export function resolveTableAssetsForRef(
+  codebookId: string,
+  tableRef: string
+): ResolvedTableAsset[] {
   const tableAssets = loadTableAssets(codebookId);
-  if (tableAssets.length === 0) return null;
+  if (tableAssets.length === 0) return [];
 
   const normalizedTarget = normalizeTableLabel(`Table ${tableRef}`);
   const matches = tableAssets.filter((entry) => {
     const normalizedLabel = normalizeTableLabel(entry.label);
-    return normalizedLabel === normalizedTarget;
+    return normalizedLabel === normalizedTarget || normalizedLabel.includes(normalizedTarget);
   });
 
-  const match = matches[0];
-  if (!match) return null;
-
-  return {
+  return matches.map((match) => ({
     isTable: true,
     tablePage: match.page,
     tableLabel: match.label ?? `Table ${tableRef}`,
@@ -195,7 +199,7 @@ export function resolveTableAssetForRef(
     tableImagePath: match.imagePath ?? null,
     tablePdfUrl: buildAssetUrl(match.pdfPath),
     tableImageUrl: buildAssetUrl(match.imagePath ?? null),
-  };
+  }));
 }
 
 export function resolveTableAssetForChunk(

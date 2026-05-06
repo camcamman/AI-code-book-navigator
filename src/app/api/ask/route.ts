@@ -10,7 +10,7 @@ import {
 } from "../../../lib/searchCodebook";
 import { AMENDMENT_MAP, getCodebookDef } from "../../../lib/codebookRegistry";
 import { getTableAssetInfoForSource } from "../../../lib/tableAssets";
-import { resolveTableAssetForRef } from "../../../lib/tableAssetRegistry";
+import { resolveTableAssetsForRef } from "../../../lib/tableAssetRegistry";
 import {
   collectAmendmentExclusions,
   extractStructureFromQuery,
@@ -18,6 +18,14 @@ import {
   getAmendmentInfo,
   normalizeIrcSectionId,
 } from "../../../lib/amendmentLinking";
+import {
+  DefinitionRef,
+  DefinitionSource,
+  findDefinitionsInText,
+  isLikelyDirectDefinitionQuestion,
+  loadDefinitionRegistry,
+  mergeDefinitionRefs,
+} from "../../../lib/definitionRegistry";
 export const runtime = "nodejs";
 
 
@@ -79,6 +87,7 @@ type AskResponse = {
   answer: string | null;
   aiSummary?: string | null;
   aiSummaryDisclaimer?: string | null;
+  definitions?: DefinitionRef[];
   sources: SourceRef[];
   amendments: AmendmentRef[];
   reason?: string;
@@ -193,7 +202,8 @@ function validateFinalAnswerOrFail(answer: string): boolean {
 
 async function generateAiSummary(
   query: string,
-  answer: string
+  answer: string,
+  definitions: DefinitionRef[] = []
 ): Promise<string | null> {
   const trimmed = answer.trim();
   if (!trimmed) return null;
@@ -213,9 +223,26 @@ Rules:
 6) Do not mention sources or citations.
 7) Do not quote large blocks of text.
 8) If the answer is a numbered list, preserve the main list structure in a compact way.
+9) If relevant code definitions are provided, use them only to understand defined terms already used in the answer.
   `.trim();
 
-  const user = `Question:\n${query}\n\nExact answer to summarize:\n${trimmed}`;
+  const definitionContext =
+    definitions.length > 0
+      ? definitions
+          .slice(0, 8)
+          .map((definition) => {
+            const amended = definition.isAmended ? " amended" : "";
+            return `${definition.term}${amended}: ${definition.definition}`;
+          })
+          .join("\n")
+      : "";
+
+  const user =
+    `Question:\n${query}\n\n` +
+    (definitionContext
+      ? `Relevant code definitions to account for while summarizing:\n${definitionContext}\n\n`
+      : "") +
+    `Exact answer to summarize:\n${trimmed}`;
 
   try {
     const res = await createChatCompletion({
@@ -232,6 +259,91 @@ Rules:
   } catch (error) {
     console.warn("[/api/ask] AI summary generation failed", error);
     return null;
+  }
+}
+
+function extractProtectedQueryTokens(query: string): string[] {
+  const tokens = new Set<string>();
+  const patterns = [
+    /\b(?:section|sec\.?|table|figure)\s+[A-Za-z]?\d+(?:\.\d+)*(?:\([0-9A-Za-z]+\))?/gi,
+    /\b[A-Za-z]\d{3,}(?:\.\d+)*(?:\([0-9A-Za-z]+\))?\b/g,
+    /\b\d+(?:\.\d+)?\s*(?:inch|inches|in\.|feet|ft\.?|mm|cm|m|psf|psi|ach|cfm|r-value|u-factor)\b/gi,
+    /"[^"]+"/g,
+  ];
+
+  for (const pattern of patterns) {
+    for (const match of query.matchAll(pattern)) {
+      const token = normalizeWhitespace(match[0] || "");
+      if (token) tokens.add(token.toLowerCase());
+    }
+  }
+
+  return Array.from(tokens);
+}
+
+function correctedQueryPreservesProtectedTokens(
+  original: string,
+  corrected: string
+): boolean {
+  const correctedLower = corrected.toLowerCase();
+  return extractProtectedQueryTokens(original).every((token) =>
+    correctedLower.includes(token)
+  );
+}
+
+async function cleanupQueryForSearch(query: string): Promise<string> {
+  const trimmed = query.trim();
+  if (!trimmed) return trimmed;
+  if (trimmed.length > 1000) return trimmed;
+
+  const system = `
+You clean up building-code search queries.
+
+Rules:
+1) Correct spelling, spacing, and obvious typos.
+2) Preserve the user's intent.
+3) Do not answer the question.
+4) Do not add new requirements, sections, tables, or facts.
+5) Preserve all code references exactly, including Section/Table/Figure labels, section numbers, table numbers, units, quoted text, and model-code abbreviations.
+6) Return JSON only.
+  `.trim();
+
+  const user =
+    `Original query:\n${trimmed}\n\n` +
+    `Return JSON in this shape:\n` +
+    `{ "correctedQuery": "...", "changed": true|false }`;
+
+  try {
+    const response = await createChatCompletion({
+      model: CHAT_MODEL,
+      response_format: { type: "json_object" },
+      messages: [
+        { role: "system", content: system },
+        { role: "user", content: user },
+      ],
+    });
+
+    const raw = response.choices[0]?.message?.content ?? "";
+    const parsed = extractJsonObject(raw);
+    const corrected =
+      typeof parsed?.correctedQuery === "string"
+        ? normalizeWhitespace(parsed.correctedQuery)
+        : "";
+
+    if (!corrected) return trimmed;
+    if (corrected.length > Math.max(1200, trimmed.length * 2)) return trimmed;
+    if (!correctedQueryPreservesProtectedTokens(trimmed, corrected)) {
+      console.warn("[/api/ask] query cleanup rejected; protected token changed", {
+        query: trimmed,
+        corrected,
+      });
+      return trimmed;
+    }
+
+    return corrected;
+  } catch (error) {
+    console.warn("[/api/ask] query cleanup failed", error);
+    return trimmed;
   }
 }
 
@@ -556,15 +668,28 @@ function normalizeQuotedReplacement(text: string): string {
 }
 
 function sourceFromChunk(chunk: IndexedChunk, sourceId: number): SourceRef {
+  const meta = (chunk as any).meta ?? {};
+  const tableAsset = getTableAssetInfoForSource({
+    codebookId: chunk.codebookId,
+    sourcePath: chunk.sourcePath,
+    meta,
+  });
   const source: SourceRef = {
     sourceId,
     id: chunk.id,
     codebookId: chunk.codebookId,
     codebookLabel: getCodebookDef(chunk.codebookId)?.label ?? chunk.codebookId,
     sourcePath: chunk.sourcePath,
-    sectionLabel: buildSourceLabel(chunk),
+    sectionLabel: buildSourceLabel(chunk) || tableAsset?.tableLabel || undefined,
     startLine: chunk.startLine,
     endLine: chunk.endLine,
+    isTable: tableAsset?.isTable,
+    tableLabel: tableAsset?.tableLabel || undefined,
+    tablePage: tableAsset?.tablePage || undefined,
+    tablePdfPath: tableAsset?.tablePdfPath || undefined,
+    tableImagePath: tableAsset?.tableImagePath || undefined,
+    tablePdfUrl: tableAsset?.tablePdfUrl || undefined,
+    tableImageUrl: tableAsset?.tableImageUrl || undefined,
   };
   const full = getWholeSourceBodyExcerpt(source);
   if (full) {
@@ -602,6 +727,191 @@ function buildAmendmentRefsFromSources(
   }
 
   return out;
+}
+
+function definitionSourceKey(source: DefinitionSource): string {
+  return `${source.sourcePath}:${source.startLine}-${source.endLine}`;
+}
+
+function sourceRefFromDefinitionSource(
+  source: DefinitionSource,
+  sourceId: number
+): SourceRef {
+  return {
+    sourceId,
+    id: source.id,
+    codebookId: source.codebookId,
+    codebookLabel: source.codebookLabel,
+    sourcePath: source.sourcePath,
+    sectionLabel: source.sectionLabel,
+    publicUrl: source.publicUrl,
+    startLine: source.startLine,
+    endLine: source.endLine,
+  };
+}
+
+function collectDefinitionSourceRefs(definitions: DefinitionRef[]): SourceRef[] {
+  const out: SourceRef[] = [];
+  const seen = new Set<string>();
+
+  for (const definition of definitions) {
+    const candidates = [
+      ...(definition.source ? [definition.source] : []),
+      ...definition.amendmentSources,
+    ];
+    for (const source of candidates) {
+      const key = definitionSourceKey(source);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push(sourceRefFromDefinitionSource(source, out.length + 1));
+    }
+  }
+
+  return out;
+}
+
+function buildDefinitionAmendmentRefs(
+  definitions: DefinitionRef[],
+  usedSources: SourceRef[]
+): AmendmentRef[] {
+  const sourceIdByKey = new Map(
+    usedSources.map((source) => [
+      `${source.sourcePath}:${source.startLine}-${source.endLine}`,
+      source.sourceId,
+    ])
+  );
+  const out: AmendmentRef[] = [];
+  const seen = new Set<string>();
+
+  for (const definition of definitions) {
+    for (const source of definition.amendmentSources) {
+      const key = definitionSourceKey(source);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      const sourceId = sourceIdByKey.get(key);
+      if (!sourceId) continue;
+      out.push({
+        sourceId,
+        id: source.id,
+        codebookId: source.codebookId,
+        codebookLabel: source.codebookLabel,
+        sourcePath: source.sourcePath,
+        sectionLabel: source.sectionLabel,
+        publicUrl: source.publicUrl,
+        startLine: source.startLine,
+        endLine: source.endLine,
+        citation: `[source ${sourceId}, lines ${source.startLine}-${source.endLine}]`,
+        fullText: source.fullText || "",
+      });
+    }
+  }
+
+  return out;
+}
+
+function definitionCitations(
+  definition: DefinitionRef,
+  usedSources: SourceRef[]
+): string {
+  const sourceIdByKey = new Map(
+    usedSources.map((source) => [
+      `${source.sourcePath}:${source.startLine}-${source.endLine}`,
+      source.sourceId,
+    ])
+  );
+  const sources = [
+    ...(definition.source ? [definition.source] : []),
+    ...definition.amendmentSources,
+  ];
+  const citations: string[] = [];
+  const seen = new Set<string>();
+  for (const source of sources) {
+    const key = definitionSourceKey(source);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    const sourceId = sourceIdByKey.get(key);
+    if (!sourceId) continue;
+    citations.push(`[source ${sourceId}, lines ${source.startLine}-${source.endLine}]`);
+  }
+  return citations.join(" ");
+}
+
+function buildDirectDefinitionAnswer(
+  definitions: DefinitionRef[]
+): { answer: string; sources: SourceRef[]; amendments: AmendmentRef[] } {
+  const usedSources = collectDefinitionSourceRefs(definitions);
+  const answerLines: string[] = [];
+
+  answerLines.push(
+    definitions.length === 1 ? "Definition" : "Definitions",
+    ""
+  );
+
+  for (const definition of definitions) {
+    const citations = definitionCitations(definition, usedSources);
+    const amendedLabel = definition.isAmended ? "Amended definition" : "Definition";
+    const instructionOnly = /^\(\d+\)\s+In\s+IRC\b/i.test(definition.definition.trim());
+    answerLines.push(`${amendedLabel}: ${definition.term}`);
+    if (instructionOnly) {
+      answerLines.push(
+        `The parsed base definition was not available. The amendment instruction states: "${definition.definition}"${citations ? ` ${citations}` : ""}`
+      );
+    } else {
+      answerLines.push(
+        `${definition.term}. ${definition.definition}${citations ? ` ${citations}` : ""}`
+      );
+    }
+    if (definition.mergeNotes && definition.mergeNotes.length > 0) {
+      answerLines.push(
+        ...definition.mergeNotes.map((note) => `Merge note: ${note}`)
+      );
+    }
+    answerLines.push("");
+  }
+
+  return {
+    answer: answerLines.join("\n").trim(),
+    sources: usedSources,
+    amendments: buildDefinitionAmendmentRefs(definitions, usedSources),
+  };
+}
+
+function collectRelevantDefinitionsForAnswer(
+  queryDefinitions: DefinitionRef[],
+  answer: string,
+  baseCodebookId: string,
+  amendmentCodebookId: string | undefined,
+  includeAmendments: boolean
+): DefinitionRef[] {
+  try {
+    const registry = loadDefinitionRegistry(
+      baseCodebookId,
+      amendmentCodebookId,
+      includeAmendments
+    );
+    const answerDefinitions = findDefinitionsInText(
+      answer,
+      registry,
+      "answer",
+      8
+    );
+    return mergeDefinitionRefs(queryDefinitions, answerDefinitions).slice(0, 10);
+  } catch (error) {
+    console.warn("[/api/ask] answer definition lookup failed", error);
+    return queryDefinitions;
+  }
+}
+
+function selectDirectDefinitionMatches(definitions: DefinitionRef[]): DefinitionRef[] {
+  return definitions
+    .filter((definition) => {
+      const term = normalizeWhitespace(definition.term).toUpperCase();
+      return !definitions.some((other) => {
+        const otherTerm = normalizeWhitespace(other.term).toUpperCase();
+        return otherTerm !== term && otherTerm.includes(term);
+      });
+    })
+    .slice(0, 4);
 }
 
 function applyGenericAmendmentToText(
@@ -1527,8 +1837,10 @@ function findAmendmentChunksByBaseSections(
 function normalizeTableIdentity(value: string | null | undefined): string {
   return normalizeWhitespace(String(value || ""))
     .replace(/^TABLE\s+/i, "")
+    .replace(/^TABLE[_-]/i, "")
     .replace(/[–—]/g, "-")
     .replace(/\s*-\s*CONTINUED$/i, "")
+    .replace(/^TABLE_/i, "")
     .toUpperCase();
 }
 
@@ -1616,16 +1928,14 @@ function findExplicitSectionChunks(
   }
 }
 
-function buildSyntheticTableSource(
+function buildSyntheticTableSources(
   codebookId: string,
   tableRef: string
-): SourceRef | null {
-  const asset = resolveTableAssetForRef(codebookId, tableRef);
-  if (!asset) return null;
-
-  return {
-    sourceId: 1,
-    id: `table-asset-${codebookId}-${tableRef}`,
+): SourceRef[] {
+  const assets = resolveTableAssetsForRef(codebookId, tableRef);
+  return assets.map((asset, idx) => ({
+    sourceId: idx + 1,
+    id: `table-asset-${codebookId}-${tableRef}-${asset.tablePage || idx + 1}`,
     codebookId,
     codebookLabel: getCodebookDef(codebookId)?.label ?? codebookId,
     sourcePath: asset.tablePdfPath || `Table ${tableRef}`,
@@ -1639,7 +1949,38 @@ function buildSyntheticTableSource(
     tableImagePath: asset.tableImagePath || undefined,
     tablePdfUrl: asset.tablePdfUrl || undefined,
     tableImageUrl: asset.tableImageUrl || undefined,
-  };
+  }));
+}
+
+function mergeStickyTableSources(
+  sources: SourceRef[],
+  stickyTableSources: SourceRef[]
+): SourceRef[] {
+  if (stickyTableSources.length === 0) return sources;
+
+  const seen = new Set(
+    sources.map(
+      (source) =>
+        source.tablePdfUrl ||
+        source.tableImageUrl ||
+        `${source.sourcePath}:${source.startLine}-${source.endLine}`
+    )
+  );
+  const out = [...sources];
+  let nextSourceId =
+    sources.reduce((max, source) => Math.max(max, source.sourceId || 0), 0) + 1;
+
+  for (const source of stickyTableSources) {
+    const key =
+      source.tablePdfUrl ||
+      source.tableImageUrl ||
+      `${source.sourcePath}:${source.startLine}-${source.endLine}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push({ ...source, sourceId: nextSourceId++ });
+  }
+
+  return out;
 }
 
 function extractJsonObject(text: string): any | null {
@@ -2320,20 +2661,27 @@ export async function POST(request: Request) {
   const history: MemoryEntry[] =
     sessionId !== null ? getSessionHistory(sessionId) : [];
 
+  const searchQuery = await cleanupQueryForSearch(query);
+  console.log("[/api/ask] query cleanup", {
+    changed: searchQuery !== query,
+    originalPreview: query.slice(0, 250),
+    searchPreview: searchQuery.slice(0, 250),
+  });
+
   // ----------------------------
   // Context-aware retrieval query
   // ----------------------------
-  let effectiveQuery = query;
+  let effectiveQuery = searchQuery;
 
   const hasCodeLike =
-    /\b([a-z]\d{3,}(\.\d+)*)\b/i.test(query) ||
-    /\b\d{1,3}-\d{1,3}-\d+(\.\d+)?\b/.test(query);
+    /\b([a-z]\d{3,}(\.\d+)*)\b/i.test(searchQuery) ||
+    /\b\d{1,3}-\d{1,3}-\d+(\.\d+)?\b/.test(searchQuery);
 
   const anchoringApplied = !hasCodeLike && history.length > 0;
   if (!hasCodeLike && history.length > 0) {
     const hint = getLastTopicHint(history) ?? getLastUserQuery(history);
     if (hint) {
-      effectiveQuery = `${hint}\n\nFollow-up question:\n${query}`;
+      effectiveQuery = `${hint}\n\nFollow-up question:\n${searchQuery}`;
     }
   }
 
@@ -2343,9 +2691,9 @@ export async function POST(request: Request) {
     effectiveQueryPreview: effectiveQuery.slice(0, 500),
   });
 
-  const structuralRef = extractStructureFromQuery(query);
-  const explicitTableRef = extractExplicitTableRef(query);
-  const explicitSectionRef = extractExplicitSectionRef(query);
+  const structuralRef = extractStructureFromQuery(searchQuery);
+  const explicitTableRef = extractExplicitTableRef(searchQuery);
+  const explicitSectionRef = extractExplicitSectionRef(searchQuery);
   console.log("[/api/ask] structuralRef", structuralRef);
   console.log("[/api/ask] explicitTableRef", explicitTableRef);
   console.log("[/api/ask] explicitSectionRef", explicitSectionRef);
@@ -2359,6 +2707,67 @@ export async function POST(request: Request) {
     baseDefIsAmendment: Boolean(baseDef?.isAmendment),
     amendmentCodebookId,
   });
+
+  let queryDefinitions: DefinitionRef[] = [];
+  try {
+    const definitionRegistry = loadDefinitionRegistry(
+      baseCodebookId,
+      amendmentCodebookId,
+      includeAmendments
+    );
+    queryDefinitions = findDefinitionsInText(
+      searchQuery,
+      definitionRegistry,
+      "query",
+      6
+    );
+    console.log("[/api/ask] definitions query matches", {
+      count: queryDefinitions.length,
+      terms: queryDefinitions.map((definition) => definition.term),
+    });
+  } catch (error) {
+    console.warn("[/api/ask] definition lookup failed", error);
+  }
+
+  if (isLikelyDirectDefinitionQuestion(searchQuery, queryDefinitions)) {
+    const directDefinitions = selectDirectDefinitionMatches(queryDefinitions);
+    const direct = buildDirectDefinitionAnswer(directDefinitions);
+    const aiSummary = await generateAiSummary(query, direct.answer, directDefinitions);
+
+    if (sessionId !== null) {
+      const now = Date.now();
+      const topicHint = directDefinitions[0]?.term
+        ? `Definition ${directDefinitions[0].term}`
+        : "Definition";
+      const updatedHistory: MemoryEntry[] = [
+        ...history,
+        { role: "user", query, timestamp: now },
+        {
+          role: "assistant",
+          answer: null as any,
+          citations: direct.sources,
+          topicHint,
+          timestamp: now,
+        },
+      ];
+      saveSessionHistory(sessionId, updatedHistory);
+    }
+
+    return NextResponse.json(
+      {
+        ok: true,
+        query,
+        codebookId: baseCodebookId,
+        answer: direct.answer,
+        aiSummary,
+        aiSummaryDisclaimer: aiSummary ? SUMMARY_DISCLAIMER : null,
+        definitions: directDefinitions,
+        sources: direct.sources,
+        amendments: direct.amendments,
+      },
+      { status: 200 }
+    );
+  }
 
   const searchedBaseChunks = await searchCodebook({
     query: effectiveQuery,
@@ -2490,15 +2899,15 @@ export async function POST(request: Request) {
   });
 
   const { sources: srcs } = buildQuotesRaw(allChunks);
-  const directTableSource =
+  const directTableSources =
     explicitTableRef !== null
-      ? buildSyntheticTableSource(baseCodebookId, explicitTableRef)
-      : null;
+      ? buildSyntheticTableSources(baseCodebookId, explicitTableRef)
+      : [];
   const explicitTableSources =
     explicitTableRef !== null
       ? dedupeSourceRefs([
           ...srcs.filter((src, idx) => chunkMatchesTableRef(allChunks[idx], explicitTableRef)),
-          ...(directTableSource ? [directTableSource] : []),
+          ...directTableSources,
         ]).map((src, idx) => ({ ...src, sourceId: idx + 1 }))
       : [];
 
@@ -2509,7 +2918,18 @@ export async function POST(request: Request) {
     amendmentCodebookId
   );
   if (amendedCodeAnswer) {
-    const aiSummary = await generateAiSummary(query, amendedCodeAnswer.answer);
+    const definitions = collectRelevantDefinitionsForAnswer(
+      queryDefinitions,
+      amendedCodeAnswer.answer,
+      baseCodebookId,
+      amendmentCodebookId,
+      includeAmendments
+    );
+    const aiSummary = await generateAiSummary(
+      query,
+      amendedCodeAnswer.answer,
+      definitions
+    );
     console.log("[/api/ask] summary", {
       baseChunks: baseChunks.length,
       amendmentChunks: amendmentChunks.length,
@@ -2526,7 +2946,8 @@ export async function POST(request: Request) {
         answer: amendedCodeAnswer.answer,
         aiSummary,
         aiSummaryDisclaimer: aiSummary ? SUMMARY_DISCLAIMER : null,
-        sources: amendedCodeAnswer.sources,
+        definitions,
+        sources: mergeStickyTableSources(amendedCodeAnswer.sources, explicitTableSources),
         amendments: amendedCodeAnswer.amendments,
       },
       { status: 200 }
@@ -2541,9 +2962,17 @@ export async function POST(request: Request) {
     baseSectionIds
   );
   if (aiAssistedAmendedCodeAnswer) {
+    const definitions = collectRelevantDefinitionsForAnswer(
+      queryDefinitions,
+      aiAssistedAmendedCodeAnswer.answer,
+      baseCodebookId,
+      amendmentCodebookId,
+      includeAmendments
+    );
     const aiSummary = await generateAiSummary(
       query,
-      aiAssistedAmendedCodeAnswer.answer
+      aiAssistedAmendedCodeAnswer.answer,
+      definitions
     );
     console.log("[/api/ask] summary", {
       baseChunks: baseChunks.length,
@@ -2561,7 +2990,11 @@ export async function POST(request: Request) {
         answer: aiAssistedAmendedCodeAnswer.answer,
         aiSummary,
         aiSummaryDisclaimer: aiSummary ? SUMMARY_DISCLAIMER : null,
-        sources: aiAssistedAmendedCodeAnswer.sources,
+        definitions,
+        sources: mergeStickyTableSources(
+          aiAssistedAmendedCodeAnswer.sources,
+          explicitTableSources
+        ),
         amendments: aiAssistedAmendedCodeAnswer.amendments,
       },
       { status: 200 }
@@ -2908,7 +3341,14 @@ export async function POST(request: Request) {
     usedSources,
     chunksByPath
   );
-  const aiSummary = await generateAiSummary(query, finalAnswer);
+  const definitions = collectRelevantDefinitionsForAnswer(
+    queryDefinitions,
+    finalAnswer,
+    baseCodebookId,
+    amendmentCodebookId,
+    includeAmendments
+  );
+  const aiSummary = await generateAiSummary(query, finalAnswer, definitions);
 
   const res: AskResponse = {
     ok: true,
@@ -2917,7 +3357,8 @@ export async function POST(request: Request) {
     answer: finalAnswer,
     aiSummary,
     aiSummaryDisclaimer: aiSummary ? SUMMARY_DISCLAIMER : null,
-    sources: usedSources,
+    definitions,
+    sources: mergeStickyTableSources(usedSources, explicitTableSources),
     amendments: amendmentRefs,
   };
 
